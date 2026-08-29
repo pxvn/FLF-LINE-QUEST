@@ -166,11 +166,6 @@ int testSpeed = 180;     // 0-255, manual jog speed used by Motor Test; tune
 const int ON_THRESH = 500;        // per-sensor lineWeight() above this = "on line";
                                    // used for calibration's live tick row and to
                                    // decide which side has a branch during a search
-const long TRY_TICKS = 90;        // encoder ticks to try one turn direction before
-                                   // falling through to the next priority option
-const unsigned long NAV_PHASE_TIMEOUT_MS = 1500; // hard time ceiling per attempt, in
-                                   // case of wheel slip (encoder ticks can't be
-                                   // trusted alone if the wheels aren't gripping)
 const int NAV_TURN_SPEED = 110;   // reduced, traction-friendly speed while searching
 
 // ---- Corner-aware speed profiling ----
@@ -776,42 +771,34 @@ const char* directionArrow(int left, int right) {
 //
 // NAV_TRACK  : normal PID tracking (a 1-2 cycle sensor blip just holds the
 //              last correction via pidLastError, doesn't freeze).
-// NAV_COAST  : entered after LOST_GRACE_MS of continuous loss. Coasts
-//              forward with a mild, decaying bias toward the last known
-//              error instead of committing to a turn -- this is what
-//              handles a dashed/segmented line or a brief real gap without
-//              ever making a turn decision. Bounded by COAST_TICKS/
-//              COAST_TIMEOUT_MS.
-// NAV_TRY    : coasting didn't find it either -- now it's a genuine
-//              decision point. Order is Left/Right, picked by whichever
-//              edge sensors saw the line more recently (evidence-based,
-//              Left wins only as the tie-break when both/neither did),
-//              U-turn always last. Each attempt is bounded by encoder
-//              ticks AND a time ceiling (guards wheel slip), abandoned for
-//              the next option the instant either bound is hit or the
-//              line reappears.
-// NAV_GIVEUP : the whole Left/Right/U-turn chain was tried MAX_TRY_ROUNDS
-//              times with no success -- STOP completely instead of
-//              searching forever. This is the fix for "roams the whole
-//              room": the old code had no upper bound on how long it would
-//              keep cycling through turn attempts. A loud alarm marks it;
-//              placing the bot back on the line resumes tracking, or BACK
-//              returns to the menu.
-const unsigned long LOST_GRACE_MS = 120;   // ignore line-loss shorter than this
-const long COAST_TICKS = 30;               // encoder ticks to coast forward before deciding
-const unsigned long COAST_TIMEOUT_MS = 500;
-const int MAX_TRY_ROUNDS = 2;              // give up after this many full Left/Right/U-turn cycles
+// NAV_SEARCH : entered after LOST_GRACE_MS of continuous loss. A SINGLE
+//              continuous forward-only arc -- direction picked once (by
+//              whichever edge sensors saw the line more recently), then
+//              escalated in stages the longer it goes unresolved: gentle
+//              differential first (handles a dashed line / brief gap with
+//              barely a course change), progressively sharper, but the
+//              INNER WHEEL NEVER GOES NEGATIVE. No in-place pivot, ever.
+//              A reversed wheel is a hard, sudden, traction-breaking move
+//              on a real gearbox, and it's what was actually causing the
+//              erratic "roams the room" behavior -- every arc here stays
+//              net-forward, same as a taped-floor bot should.
+// NAV_GIVEUP : the arc ran for SEARCH_MAX_TICKS / SEARCH_TIME_CEILING_MS
+//              with no success -- STOP completely instead of searching
+//              forever. A loud alarm marks it; placing the bot back on the
+//              line resumes tracking on its own, or BACK returns to menu.
+const unsigned long LOST_GRACE_MS = 120;      // ignore line-loss shorter than this
+const long SEARCH_STAGE1_TICKS = 20;          // gentle bias while this young (dashed-line-friendly)
+const long SEARCH_STAGE2_TICKS = 55;          // sharper bias between stage1 and here
+const long SEARCH_MAX_TICKS = 110;            // sharpest forward-only arc beyond here; give up past this
+const unsigned long SEARCH_TIME_CEILING_MS = 1800; // backup vs wheel slip (ticks alone can't be trusted)
 
-enum NavMode { NAV_TRACK, NAV_COAST, NAV_TRY, NAV_GIVEUP };
+enum NavMode { NAV_TRACK, NAV_SEARCH, NAV_GIVEUP };
 NavMode navMode = NAV_TRACK;
-int tryOrder[3] = {0, 1, 2}; // 0=Left,1=Right,2=U-turn -- reordered on each COAST->TRY transition
-int tryIndex = 0;
-int tryRound = 0;
+int searchDir = 0; // 0=curve left (right wheel outer), 1=curve right (left wheel outer) -- picked once per search
 long navEncStart = 0;
 unsigned long navPhaseStart = 0;
 unsigned long lostSince = 0;
 bool leftBranchSeen = false, rightBranchSeen = false;
-const char* dirName[3] = {"LEFT", "RIGHT", "UTURN"};
 
 // Corner-aware cruise speed: back off the harder the PID has to correct,
 // so a higher baseSpeed doesn't mean breaking traction on every curve.
@@ -824,33 +811,11 @@ int dynamicCruiseSpeed(float output) {
   return max(cruise, baseSpeed / MIN_CRUISE_FRACTION);
 }
 
-// Move to the next attempt in the priority chain, or give up (stop dead)
-// if the whole chain has been tried MAX_TRY_ROUNDS times. This is the hard
-// upper bound that was missing before -- without it, a genuinely-off-track
-// bot would cycle Left/Right/U-turn forever.
-void advanceTryStep(long encNow) {
-  tryIndex++;
-  if (tryIndex >= 3) {
-    tryIndex = 0;
-    tryRound++;
-    if (tryRound >= MAX_TRY_ROUNDS) {
-      navMode = NAV_GIVEUP;
-      stopMotors();
-      for (int i = 0; i < 4; i++) { beep(3200, 150); delay(180); } // loud, unmistakable
-      return;
-    }
-  }
-  navEncStart = encNow;
-  navPhaseStart = millis();
-}
-
 void lineFollowLoop() {
   if (lineFollowStarting) {
     pidIntegral = 0;
     pidLastError = 0;
     navMode = NAV_TRACK;
-    tryIndex = 0;
-    tryRound = 0;
     lostSince = 0;
     leftBranchSeen = false;
     rightBranchSeen = false;
@@ -871,9 +836,8 @@ void lineFollowLoop() {
   float error = lineFound ? (float)weightedSum / (float)sum : pidLastError;
 
   // Remember which side has shown a branch recently, using the outermost
-  // 3 sensors each edge -- used both to skip a direction with nothing
-  // there, and to pick which side NAV_TRY tries first (evidence, not a
-  // fixed hardcoded side).
+  // 3 sensors each edge -- used to pick which way NAV_SEARCH curves first
+  // (evidence-based, not a fixed hardcoded side).
   if (lineWeight(0) > ON_THRESH || lineWeight(1) > ON_THRESH || lineWeight(2) > ON_THRESH) leftBranchSeen = true;
   if (lineWeight(NUM_SENSORS-1) > ON_THRESH || lineWeight(NUM_SENSORS-2) > ON_THRESH || lineWeight(NUM_SENSORS-3) > ON_THRESH) rightBranchSeen = true;
 
@@ -884,15 +848,16 @@ void lineFollowLoop() {
   long encNow = (leftEncCount + rightEncCount) / 2;
   long ticksThisPhase = encNow - navEncStart;
   unsigned long msThisPhase = millis() - navPhaseStart;
-  bool tryExpired = (ticksThisPhase >= TRY_TICKS) || (msThisPhase >= NAV_PHASE_TIMEOUT_MS);
 
   int left = 0, right = 0;
 
   if (navMode == NAV_TRACK) {
     if (sustainedLoss) {
-      navMode = NAV_COAST;
+      navMode = NAV_SEARCH;
       navEncStart = encNow;
       navPhaseStart = millis();
+      // Direction picked ONCE here, from evidence, not re-decided per stage.
+      searchDir = (rightBranchSeen && !leftBranchSeen) ? 1 : 0; // 0=left tie-break
       leftBranchSeen = false;
       rightBranchSeen = false;
       beep(1200, 50);
@@ -911,48 +876,26 @@ void lineFollowLoop() {
     left  = constrain(cruise - (int)output, -255, 255);
     right = constrain(cruise + (int)output, -255, 255);
 
-  } else if (navMode == NAV_COAST) {
-    // Dashed-line-friendly first response: mild bias toward the last
-    // known error, not a committed turn. Most gaps resolve here.
-    int bias = constrain((int)(pidLastError * 0.03f), -NAV_TURN_SPEED / 2, NAV_TURN_SPEED / 2);
-    left  = constrain(NAV_TURN_SPEED - bias, -255, 255);
-    right = constrain(NAV_TURN_SPEED + bias, -255, 255);
+  } else if (navMode == NAV_SEARCH) {
     if (lineFound) {
       navMode = NAV_TRACK;
       pidLastError = error;
       lostSince = 0;
-    } else if (ticksThisPhase >= COAST_TICKS || msThisPhase >= COAST_TIMEOUT_MS) {
-      // Coasting didn't find it -- genuine decision point. Order Left vs
-      // Right by recent edge evidence; U-turn is always the last resort.
-      if (rightBranchSeen && !leftBranchSeen) { tryOrder[0] = 1; tryOrder[1] = 0; }
-      else                                     { tryOrder[0] = 0; tryOrder[1] = 1; } // Left-first tie-break
-      tryOrder[2] = 2;
-      tryIndex = 0;
-      tryRound = 0;
-      navMode = NAV_TRY;
-      navEncStart = encNow;
-      navPhaseStart = millis();
-      beep(1500, 50);
-    }
-
-  } else if (navMode == NAV_TRY) {
-    int choice = tryOrder[tryIndex];
-    bool available = (choice == 0) ? leftBranchSeen : (choice == 1) ? rightBranchSeen : true;
-    if (!available) {
-      advanceTryStep(encNow);
+    } else if (ticksThisPhase >= SEARCH_MAX_TICKS || msThisPhase >= SEARCH_TIME_CEILING_MS) {
+      navMode = NAV_GIVEUP;
+      stopMotors();
+      for (int i = 0; i < 4; i++) { beep(3200, 150); delay(180); } // loud, unmistakable
     } else {
-      if (choice == 0)      { left = -NAV_TURN_SPEED; right =  NAV_TURN_SPEED; } // pivot left
-      else if (choice == 1) { left =  NAV_TURN_SPEED; right = -NAV_TURN_SPEED; } // pivot right
-      else                  { left = -NAV_TURN_SPEED; right =  NAV_TURN_SPEED; } // U-turn
-      if (lineFound) {
-        navMode = NAV_TRACK;
-        pidLastError = error;
-        lostSince = 0;
-      } else if (tryExpired) {
-        // This direction didn't pan out within its bound -- fall through
-        // to the next priority option, not a repeat of the same guess.
-        advanceTryStep(encNow);
-      }
+      // Escalating forward-only arc -- inner wheel slows as the search
+      // drags on, but it never goes negative. Outer wheel stays at full
+      // search speed throughout, so the bot keeps making net-forward
+      // progress the whole time (never a stationary spin).
+      float innerFrac = (ticksThisPhase < SEARCH_STAGE1_TICKS) ? 0.55f
+                       : (ticksThisPhase < SEARCH_STAGE2_TICKS) ? 0.15f
+                       : 0.0f;
+      int inner = (int)(NAV_TURN_SPEED * innerFrac);
+      if (searchDir == 0) { left = inner;         right = NAV_TURN_SPEED; } // curve left
+      else                 { left = NAV_TURN_SPEED; right = inner;        } // curve right
     }
 
   } else { // NAV_GIVEUP -- stopped dead, no motion, until repositioned or BACK
@@ -961,7 +904,6 @@ void lineFollowLoop() {
       navMode = NAV_TRACK;
       pidLastError = error;
       lostSince = 0;
-      tryRound = 0;
       beepStart();
     }
   }
@@ -979,8 +921,7 @@ void lineFollowLoop() {
     oledHeader("LINE FOLLOWING");
     display.setCursor(0, 14);
     if (navMode == NAV_TRACK)       { display.print("Err: "); display.println((int)error); }
-    else if (navMode == NAV_COAST)  { display.println("Coast: gap?"); }
-    else if (navMode == NAV_TRY)    { display.print("Try: "); display.println(dirName[tryOrder[tryIndex]]); }
+    else if (navMode == NAV_SEARCH) { display.print("Search: "); display.println(searchDir == 0 ? "<-" : "->"); }
     else                             { display.println("STOPPED - lost"); }
     display.setCursor(0, 24);
     display.print("L:"); display.print(left);
