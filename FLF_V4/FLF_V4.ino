@@ -351,20 +351,21 @@ bool wasPressed(Button &b) {
 }
 
 // ---- Logical roles, mapped onto physical buttons here (and ONLY here).
-// Physical wiring: SW1, SW2, SW3, SW4. Current layout rotates the roles
-// one step around the enclosure: SW1->BACK, SW2->UP, SW3->OK (unchanged),
-// SW4->DOWN. Every screen below calls up()/down()/select()/back() by
-// role, never by SWx, so the physical layout can change again by editing
-// only this block.
-bool up()     { return wasPressed(btn2); }  // physical SW2
-bool down()   { return wasPressed(btn4); }  // physical SW4
+// Physical wiring: SW1, SW2, SW3, SW4. Rotated one more step in the same
+// direction as before (role@SW1 -> SW2, role@SW2 -> SW4, closing the loop
+// role@SW4 -> SW1; SW3/OK untouched): SW1->DOWN, SW2->BACK, SW3->OK,
+// SW4->UP. Every screen below calls up()/down()/select()/back() by role,
+// never by SWx, so the physical layout can change again by editing only
+// this block.
+bool up()     { return wasPressed(btn4); }  // physical SW4
+bool down()   { return wasPressed(btn1); }  // physical SW1
 bool select() { return wasPressed(btn3); }  // physical SW3
-bool back()   { return wasPressed(btn1); }  // physical SW1
+bool back()   { return wasPressed(btn2); }  // physical SW2
 
 // Raw (non-edge-triggered) hold state for the same UP/DOWN roles, used by
 // Motor Test's hold-to-drive controls.
-bool upHeld()   { return digitalRead(SW2) == LOW; }
-bool downHeld() { return digitalRead(SW4) == LOW; }
+bool upHeld()   { return digitalRead(SW4) == LOW; }
+bool downHeld() { return digitalRead(SW1) == LOW; }
 
 // =====================================================================
 //  MULTIPLEXER / SENSOR READING
