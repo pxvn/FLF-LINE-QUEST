@@ -81,9 +81,9 @@ struct Button {
 // =====================================================================
 // ---- Multiplexer (CD74HC4067) ----
 #define MUX_SIG   1
-#define MUX_S3    5
+#define MUX_S3    2
 #define MUX_S2    4
-#define MUX_S1    2
+#define MUX_S1    5
 #define MUX_S0    6
 
 // ---- OLED (I2C) ----
@@ -119,7 +119,7 @@ struct Button {
 #define NUM_LEDS  2
 
 // ---- Buzzer ----
-#define BUZZER_PIN 38
+#define BUZZER_PIN 37
 
 // =====================================================================
 //  CONSTANTS
