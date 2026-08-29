@@ -148,6 +148,9 @@ int testSpeed = 180;     // 0-255, manual jog speed used by Motor Test; tune
                           // it from the Settings screen (adjustable there
                           // as its own parameter, see "TestSpd")
 
+const int ON_THRESH = 500; // per-sensor lineWeight() above this = "on line";
+                            // used by calibration's live tick row
+
 // =====================================================================
 //  GLOBAL OBJECTS
 // =====================================================================
@@ -578,19 +581,32 @@ void calibrationLoop() {
   }
 
   if (up()) { lineIsDark = !lineIsDark; beep(1700, 20); }
+  normalizeSensors(); // needed live (not just at Save) so the on-line tick row below is accurate
 
   static unsigned long lastDraw = 0;
   if (millis() - lastDraw >= 40) {
     lastDraw = millis();
 
-    oledHeader("CALIBRATING");
-    display.setCursor(86, 0);
-    display.print(lineIsDark ? "DARK" : "LITE");
+    // Overall contrast quality: average (max-min) spread across all
+    // sensors. Low spread means the sensor barely sees a difference
+    // between line and background -- height, ambient light, or a sensor
+    // that never got waved over the line will all show up as LOW here,
+    // instead of you having to guess whether you calibrated "enough".
+    long totalSpread = 0;
+    for (int i = 0; i < NUM_SENSORS; i++) totalSpread += (sensorMax[i] - sensorMin[i]);
+    bool goodContrast = (totalSpread / NUM_SENSORS) > 800; // out of a 0-4095 ADC range
+
+    oledHeader("CALIB");
+    display.setCursor(60, 0);
+    display.print(lineIsDark ? "DRK" : "LIT");
+    display.setCursor(96, 0);
+    display.print(goodContrast ? "OK" : "LOW");
 
     // ---- per-sensor bar visualizer (one bar per sensor, live) ----
-    const int barTop    = 12;             // just under the header line
-    const int barBottom = OLED_H;         // 64
-    const int barMaxH   = barBottom - barTop;
+    const int tickY      = 11;            // 1px row: which sensors read "on line" right now
+    const int barTop     = 13;
+    const int barBottom  = OLED_H;        // 64
+    const int barMaxH    = barBottom - barTop;
     int slot = OLED_W / NUM_SENSORS;      // ~9px per sensor on a 128-wide display
     if (slot < 6) slot = 6;
 
@@ -606,6 +622,9 @@ void calibrationLoop() {
       if (w < 2) w = 2;
       display.drawRect(x, barTop, w, barMaxH, SSD1306_WHITE);          // outline
       display.fillRect(x + 1, barBottom - h, max(w - 2, 1), h, SSD1306_WHITE); // fill from bottom
+      // Live proof the DARK/LITE setting is doing what you think: a tick
+      // above any sensor Line Follow would currently treat as "on line".
+      if (lineWeight(i) > ON_THRESH) display.fillRect(x, tickY, w, 1, SSD1306_WHITE);
     }
 
     oledFooter("OK=Save BK=Cancel UP=Inv");
@@ -805,27 +824,55 @@ void lineFollowLoop() {
 //   DOWN = +10 on selected channel
 //   OK   = switch channel (R/G/B)
 //   BACK = save & back
-int ledChannel = 0; // 0=R,1=G,2=B
-const char* ledChannelName[3] = {"R", "G", "B"};
+int ledChannel = 0; // 0=R,1=G,2=B,3=PRESET
+const char* ledChannelName[4] = {"R", "G", "B", "PRESET"};
+
+// Named preset colors -- cycle to the 4th "channel" (PRESET) with OK, then
+// UP/DN pick a color and apply it instantly, instead of hand-tuning R/G/B.
+struct NamedColor { const char* name; uint8_t r, g, b; };
+const NamedColor ledPresets[] = {
+  {"RED", 255, 0, 0}, {"GREEN", 0, 255, 0}, {"BLUE", 0, 0, 255},
+  {"WHITE", 255, 255, 255}, {"CYAN", 0, 255, 255}, {"MAGENTA", 255, 0, 255},
+  {"YELLOW", 255, 200, 0}, {"ORANGE", 255, 80, 0}, {"PURPLE", 130, 0, 200}
+};
+const int ledPresetCount = sizeof(ledPresets) / sizeof(ledPresets[0]);
+int presetIndex = 0;
+
+void applyLedPreset() {
+  idleR = ledPresets[presetIndex].r;
+  idleG = ledPresets[presetIndex].g;
+  idleB = ledPresets[presetIndex].b;
+}
 
 void ledColorLoop() {
   oledHeader("LED COLOR");
   display.setCursor(0, 14);
   display.print("Channel: "); display.println(ledChannelName[ledChannel]);
-  display.setCursor(0, 24);
-  display.print("R:"); display.print(idleR);
-  display.print(" G:"); display.print(idleG);
-  display.print(" B:"); display.println(idleB);
-  oledFooter("UP=- DN=+ OK=Next");
+
+  if (ledChannel == 3) {
+    display.setCursor(0, 24);
+    display.print("Preset: "); display.println(ledPresets[presetIndex].name);
+    oledFooter("UP/DN=Pick OK=Next");
+  } else {
+    display.setCursor(0, 24);
+    display.print("R:"); display.print(idleR);
+    display.print(" G:"); display.print(idleG);
+    display.print(" B:"); display.println(idleB);
+    oledFooter("UP=- DN=+ OK=Next");
+  }
   display.setCursor(0, 46);
   display.println("BACK=Save & Back");
   display.display();
 
-  uint8_t* chan = (ledChannel == 0) ? &idleR : (ledChannel == 1) ? &idleG : &idleB;
-
-  if (up())   { *chan = (uint8_t)max(0, *chan - 10); beep(1600,20); }
-  if (down()) { *chan = (uint8_t)min(255, *chan + 10); beep(2000,20); }
-  if (select()) { ledChannel = (ledChannel + 1) % 3; beep(2200,20); }
+  if (ledChannel == 3) {
+    if (up())   { presetIndex = (presetIndex - 1 + ledPresetCount) % ledPresetCount; applyLedPreset(); beep(1600,20); }
+    if (down()) { presetIndex = (presetIndex + 1) % ledPresetCount; applyLedPreset(); beep(2000,20); }
+  } else {
+    uint8_t* chan = (ledChannel == 0) ? &idleR : (ledChannel == 1) ? &idleG : &idleB;
+    if (up())   { *chan = (uint8_t)max(0, *chan - 10); beep(1600,20); }
+    if (down()) { *chan = (uint8_t)min(255, *chan + 10); beep(2000,20); }
+  }
+  if (select()) { ledChannel = (ledChannel + 1) % 4; beep(2200,20); }
 
   setLED({idleR, idleG, idleB}); // live preview
 
@@ -878,8 +925,8 @@ void settingsLoop() {
       case 0: Kp += dir * 0.005f; Kp = max(0.0f, Kp); break;
       case 1: Ki += dir * 0.0001f; Ki = max(0.0f, Ki); break;
       case 2: Kd += dir * 0.02f; Kd = max(0.0f, Kd); break;
-      case 3: baseSpeed += dir * 5; baseSpeed = constrain(baseSpeed, 0, 255); break;
-      case 4: testSpeed += dir * 5; testSpeed = constrain(testSpeed, 0, 255); break;
+      case 3: baseSpeed += dir * 25; baseSpeed = constrain(baseSpeed, 0, 255); break;
+      case 4: testSpeed += dir * 25; testSpeed = constrain(testSpeed, 0, 255); break;
     }
     beep(2000, 20);
   }

@@ -961,27 +961,55 @@ void lineFollowLoop() {
 //   DOWN = +10 on selected channel
 //   OK   = switch channel (R/G/B)
 //   BACK = save & back
-int ledChannel = 0; // 0=R,1=G,2=B
-const char* ledChannelName[3] = {"R", "G", "B"};
+int ledChannel = 0; // 0=R,1=G,2=B,3=PRESET
+const char* ledChannelName[4] = {"R", "G", "B", "PRESET"};
+
+// Named preset colors -- cycle to the 4th "channel" (PRESET) with OK, then
+// UP/DN pick a color and apply it instantly, instead of hand-tuning R/G/B.
+struct NamedColor { const char* name; uint8_t r, g, b; };
+const NamedColor ledPresets[] = {
+  {"RED", 255, 0, 0}, {"GREEN", 0, 255, 0}, {"BLUE", 0, 0, 255},
+  {"WHITE", 255, 255, 255}, {"CYAN", 0, 255, 255}, {"MAGENTA", 255, 0, 255},
+  {"YELLOW", 255, 200, 0}, {"ORANGE", 255, 80, 0}, {"PURPLE", 130, 0, 200}
+};
+const int ledPresetCount = sizeof(ledPresets) / sizeof(ledPresets[0]);
+int presetIndex = 0;
+
+void applyLedPreset() {
+  idleR = ledPresets[presetIndex].r;
+  idleG = ledPresets[presetIndex].g;
+  idleB = ledPresets[presetIndex].b;
+}
 
 void ledColorLoop() {
   oledHeader("LED COLOR");
   display.setCursor(0, 14);
   display.print("Channel: "); display.println(ledChannelName[ledChannel]);
-  display.setCursor(0, 24);
-  display.print("R:"); display.print(idleR);
-  display.print(" G:"); display.print(idleG);
-  display.print(" B:"); display.println(idleB);
-  oledFooter("UP=- DN=+ OK=Next");
+
+  if (ledChannel == 3) {
+    display.setCursor(0, 24);
+    display.print("Preset: "); display.println(ledPresets[presetIndex].name);
+    oledFooter("UP/DN=Pick OK=Next");
+  } else {
+    display.setCursor(0, 24);
+    display.print("R:"); display.print(idleR);
+    display.print(" G:"); display.print(idleG);
+    display.print(" B:"); display.println(idleB);
+    oledFooter("UP=- DN=+ OK=Next");
+  }
   display.setCursor(0, 46);
   display.println("BACK=Save & Back");
   display.display();
 
-  uint8_t* chan = (ledChannel == 0) ? &idleR : (ledChannel == 1) ? &idleG : &idleB;
-
-  if (up())   { *chan = (uint8_t)max(0, *chan - 10); beep(1600,20); }
-  if (down()) { *chan = (uint8_t)min(255, *chan + 10); beep(2000,20); }
-  if (select()) { ledChannel = (ledChannel + 1) % 3; beep(2200,20); }
+  if (ledChannel == 3) {
+    if (up())   { presetIndex = (presetIndex - 1 + ledPresetCount) % ledPresetCount; applyLedPreset(); beep(1600,20); }
+    if (down()) { presetIndex = (presetIndex + 1) % ledPresetCount; applyLedPreset(); beep(2000,20); }
+  } else {
+    uint8_t* chan = (ledChannel == 0) ? &idleR : (ledChannel == 1) ? &idleG : &idleB;
+    if (up())   { *chan = (uint8_t)max(0, *chan - 10); beep(1600,20); }
+    if (down()) { *chan = (uint8_t)min(255, *chan + 10); beep(2000,20); }
+  }
+  if (select()) { ledChannel = (ledChannel + 1) % 4; beep(2200,20); }
 
   setLED({idleR, idleG, idleB}); // live preview
 
