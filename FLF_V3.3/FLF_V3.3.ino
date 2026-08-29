@@ -204,9 +204,9 @@ bool lineFollowStarting = false;
 
 // Menu
 const char* menuItems[] = {
+  "Start Line Follow",
   "Calibrate Sensors",
   "Test Motors",
-  "Start Line Follow",
   "LED Color",
   "Settings"
 };
@@ -597,9 +597,9 @@ void handleMenu() {
   if (down()) { menuIndex = (menuIndex + 1) % menuCount; beep(1800, 30); }
   if (select()) {
     switch (menuIndex) {
-      case 0: enterState(STATE_CALIBRATION); calibPhase = CALIB_SELECT_MODE; break;
-      case 1: enterState(STATE_MOTOR_TEST); break;
-      case 2: enterState(STATE_LINE_FOLLOW); lineFollowStarting = true; break;
+      case 0: enterState(STATE_LINE_FOLLOW); lineFollowStarting = true; break;
+      case 1: enterState(STATE_CALIBRATION); calibPhase = CALIB_SELECT_MODE; break;
+      case 2: enterState(STATE_MOTOR_TEST); break;
       case 3: enterState(STATE_LED_COLOR); break;
       case 4: enterState(STATE_PID_TUNE); break;
     }
@@ -901,7 +901,7 @@ void lineFollowLoop() {
   // sensors are actually lit (which End Zone detection depends on).
   long weightedSum = 0, rawSum = 0, gainedSum = 0;
   int onCount = 0;
-  bool leftEdgeNow = false, rightEdgeNow = false;
+  bool leftEdgeNow = false, rightEdgeNow = false, centerFound = false;
   for (int i = 0; i < NUM_SENSORS; i++) {
     int w = lineWeight(i);
     rawSum += w;
@@ -911,8 +911,8 @@ void lineFollowLoop() {
     gainedSum += gw;
     if (w > ON_THRESH) {
       onCount++;
-      if (i < EDGE_COUNT) leftEdgeNow = true;
-      else if (i >= NUM_SENSORS - EDGE_COUNT) rightEdgeNow = true;
+      if (edge) { if (i < EDGE_COUNT) leftEdgeNow = true; else rightEdgeNow = true; }
+      else centerFound = true;
     }
   }
   // Update the sticky turn-direction memory from this cycle's edge reads.
@@ -941,27 +941,34 @@ void lineFollowLoop() {
     endZoneSince = 0;
   }
 
-  bool lineFound = rawSum > (long)(NUM_SENSORS * 30); // threshold: something detected
+  bool lineFound = rawSum > (long)(NUM_SENSORS * 30); // "anything at all" -- still used for
+                                                        // integral gating, LED, and the display
   float error;
-  if (lineFound) {
+  bool tracking; // true only when center sees the line -> smooth PID, integral allowed
+
+  if (centerFound) {
+    // Mid line is there: just go straight (well, follow it) -- no turn
+    // decision needed at all. Full weighted average (edge-gained) as usual.
+    tracking = true;
     error = (float)weightedSum / (float)gainedSum;
     lineLostSince = 0;
+  } else if (leftEdgeNow || rightEdgeNow) {
+    // Mid line is GONE but an edge sees it RIGHT NOW: commit that way
+    // immediately -- don't wait for the whole array to go blank first.
+    tracking = false;
+    if (leftEdgeNow && rightEdgeNow) error = turnPriorityLeft ? -6500 : 6500;
+    else                              error = leftEdgeNow ? -6500 : 6500;
+    lineLostSince = 0;
+    if (millis() - lastLineLostBeep > 500) { beepError(); lastLineLostBeep = millis(); }
   } else {
+    // Nothing anywhere -- center AND both edges all blank. Coast briefly
+    // (covers a genuine momentary gap), then it's a dead end -> U-turn.
+    tracking = false;
     if (lineLostSince == 0) lineLostSince = millis();
     unsigned long lostFor = millis() - lineLostSince;
     if (lostFor < LINE_LOST_COAST_MS) {
-      // Coast straight first -- most junction crossings and gaps resolve
-      // here with zero turn decision made.
       error = 0;
-    } else if (lastEdgeDir != 0) {
-      // Real branch/corner: an edge sensor lit up on the way in, so steer
-      // hard toward that side (not a hardcoded side, not a coin flip).
-      error = (lastEdgeDir > 0) ? 6500 : -6500;
-      if (millis() - lastLineLostBeep > 500) { beepError(); lastLineLostBeep = millis(); }
     } else {
-      // Neither edge ever saw anything on the way in: the track just
-      // stops here -- a checkpoint dead end, not a branch. Controlled
-      // 180 in place, not a guessed corner turn.
       uTurning = true;
       uTurnStart = millis();
       beep(1000, 100);
@@ -971,11 +978,11 @@ void lineFollowLoop() {
     }
   }
 
-  // Only accumulate the integral term while actually on the line — while
-  // searching, `error` is pinned to +-6500 every tick, which would slam
-  // the integral into its clamp almost instantly and cause a hard
-  // overshoot the moment the line is reacquired.
-  if (lineFound) {
+  // Only accumulate the integral term while smoothly tracking the center --
+  // a committed hard turn or a coast has `error` pinned to a saturated or
+  // zero value that would either slam the integral into its clamp or just
+  // waste the accumulated history; freeze it outside normal tracking.
+  if (tracking) {
     pidIntegral += error;
     pidIntegral = constrain(pidIntegral, -50000, 50000);
   }
@@ -1003,7 +1010,7 @@ void lineFollowLoop() {
     display.setCursor(90, 24);
     display.print(directionArrow(left, right));
     display.setCursor(0, 40);
-    display.println(lineFound ? "Line: OK" : (lineLostSince && millis() - lineLostSince < LINE_LOST_COAST_MS) ? "Line: COAST" : "Line: LOST");
+    display.println(tracking ? "Mid: OK" : (leftEdgeNow || rightEdgeNow) ? (leftEdgeNow ? "Turn: LEFT" : "Turn: RIGHT") : "Mid: LOST (coast)");
     oledFooter("BACK = Stop");
     display.display();
 
