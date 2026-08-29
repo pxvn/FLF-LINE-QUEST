@@ -66,6 +66,8 @@ enum State {
 };
 
 enum MotorTestTarget { MT_LEFT, MT_RIGHT, MT_BOTH };
+enum CalibMode { CALIB_MANUAL, CALIB_AUTO };
+enum CalibPhase { CALIB_SELECT_MODE, CALIB_RUNNING, CALIB_AUTO_DONE };
 
 struct RGB { uint8_t r, g, b; };
 
@@ -164,7 +166,11 @@ Preferences prefs;
 State currentState = STATE_MENU;
 
 // Cross-mode flags (declared here so menu code below can reference them)
-bool calibResetFlag = false;
+CalibMode calibMode = CALIB_MANUAL;
+CalibPhase calibPhase = CALIB_SELECT_MODE;
+unsigned long calibAutoStart = 0;
+const unsigned long CALIB_AUTO_DURATION_MS = 6000; // how long the auto-spin runs
+const int CALIB_AUTO_SPEED = 140;                  // rotation speed while auto-calibrating
 bool lineFollowStarting = false;
 
 // Menu
@@ -554,7 +560,7 @@ void handleMenu() {
   if (down()) { menuIndex = (menuIndex + 1) % menuCount; beep(1800, 30); }
   if (select()) {
     switch (menuIndex) {
-      case 0: enterState(STATE_CALIBRATION); calibResetFlag = true; break;
+      case 0: enterState(STATE_CALIBRATION); calibPhase = CALIB_SELECT_MODE; break;
       case 1: enterState(STATE_MOTOR_TEST); break;
       case 2: enterState(STATE_LINE_FOLLOW); lineFollowStarting = true; break;
       case 3: enterState(STATE_LED_COLOR); break;
@@ -567,9 +573,44 @@ void handleMenu() {
 //  MODE: CALIBRATION
 // =====================================================================
 void calibrationLoop() {
-  if (calibResetFlag) {
-    for (int i = 0; i < NUM_SENSORS; i++) { sensorMin[i] = 4095; sensorMax[i] = 0; }
-    calibResetFlag = false;
+  // ---- Step 1: pick MANUAL (hand-sweep) or AUTO (360 deg motor spin) ----
+  if (calibPhase == CALIB_SELECT_MODE) {
+    oledHeader("CALIBRATE");
+    display.setCursor(0, 14);
+    display.println("Choose mode:");
+    display.setCursor(4, 28);
+    display.print(calibMode == CALIB_MANUAL ? "> " : "  ");
+    display.println("MANUAL (hand sweep)");
+    display.setCursor(4, 38);
+    display.print(calibMode == CALIB_AUTO ? "> " : "  ");
+    display.println("AUTO (360 spin)");
+    oledFooter("UD=Pick OK=Go BK=Back");
+    display.display();
+
+    if (up() || down()) { calibMode = (calibMode == CALIB_MANUAL) ? CALIB_AUTO : CALIB_MANUAL; beep(1800, 20); }
+    if (select()) {
+      for (int i = 0; i < NUM_SENSORS; i++) { sensorMin[i] = 4095; sensorMax[i] = 0; }
+      calibPhase = CALIB_RUNNING;
+      if (calibMode == CALIB_AUTO) { calibAutoStart = millis(); beepStart(); }
+      else beep(1800, 30);
+    }
+    if (back()) { calibPhase = CALIB_SELECT_MODE; beepBack(); enterState(STATE_MENU); }
+    return;
+  }
+
+  // ---- Step 2: AUTO spins in place for CALIB_AUTO_DURATION_MS, then stops
+  // and hands off to the same review/save flow MANUAL always used. ----
+  bool spinning = (calibMode == CALIB_AUTO && calibPhase == CALIB_RUNNING);
+  if (spinning) {
+    if (millis() - calibAutoStart < CALIB_AUTO_DURATION_MS) {
+      setLeftMotor(CALIB_AUTO_SPEED);
+      setRightMotor(-CALIB_AUTO_SPEED);
+    } else {
+      stopMotors();
+      calibPhase = CALIB_AUTO_DONE;
+      spinning = false;
+      beepStart();
+    }
   }
 
   // Sensor read + min/max tracking run every loop (cheap) so calibration
@@ -596,11 +637,9 @@ void calibrationLoop() {
     for (int i = 0; i < NUM_SENSORS; i++) totalSpread += (sensorMax[i] - sensorMin[i]);
     bool goodContrast = (totalSpread / NUM_SENSORS) > 800; // out of a 0-4095 ADC range
 
-    oledHeader("CALIB");
-    display.setCursor(60, 0);
-    display.print(lineIsDark ? "DRK" : "LIT");
+    oledHeader(spinning ? "CALIB (spinning)" : "CALIB");
     display.setCursor(96, 0);
-    display.print(goodContrast ? "OK" : "LOW");
+    display.print(lineIsDark ? "DRK" : "LIT");
 
     // ---- per-sensor bar visualizer (one bar per sensor, live) ----
     const int tickY      = 11;            // 1px row: which sensors read "on line" right now
@@ -627,17 +666,27 @@ void calibrationLoop() {
       if (lineWeight(i) > ON_THRESH) display.fillRect(x, tickY, w, 1, SSD1306_WHITE);
     }
 
-    oledFooter("OK=Save BK=Cancel UP=Inv");
+    if (spinning) {
+      oledFooter("Spinning.. BK=Stop");
+    } else {
+      display.setCursor(0, 48);
+      display.print("Contrast: "); display.println(goodContrast ? "OK" : "LOW");
+      oledFooter("OK=Save BK=Cancel UP=Inv");
+    }
     display.display();
   }
 
   if (select()) { // Save & exit — saveCalibration() itself beeps/flashes
     // the verified pass/fail result, so no extra beepStart() here.
+    stopMotors(); // in case OK is pressed mid-spin to stop and save early
     saveCalibration();
+    calibPhase = CALIB_SELECT_MODE;
     enterState(STATE_MENU);
   }
-  if (back()) { // Cancel without saving
+  if (back()) { // Cancel without saving (also stops an in-progress spin)
+    stopMotors();
     loadCalibration();
+    calibPhase = CALIB_SELECT_MODE;
     beepBack();
     enterState(STATE_MENU);
   }
