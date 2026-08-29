@@ -42,6 +42,7 @@
 
 #include <Wire.h>
 #include <math.h>
+#include <string.h>  // memcmp, used to verify a save actually landed in flash
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_NeoPixel.h>
@@ -80,9 +81,9 @@ struct Button {
 // =====================================================================
 // ---- Multiplexer (CD74HC4067) ----
 #define MUX_SIG   1
-#define MUX_S3    2
+#define MUX_S3    5
 #define MUX_S2    4
-#define MUX_S1    5
+#define MUX_S1    2
 #define MUX_S0    6
 
 // ---- OLED (I2C) ----
@@ -143,6 +144,9 @@ float Kp = 0.06;
 float Ki = 0.0006;
 float Kd = 0.4;
 int baseSpeed = 150;     // 0-255, forward cruise speed while line following
+int testSpeed = 180;     // 0-255, manual jog speed used by Motor Test; tune
+                          // it from the Settings screen (adjustable there
+                          // as its own parameter, see "TestSpd")
 
 // =====================================================================
 //  GLOBAL OBJECTS
@@ -166,7 +170,7 @@ const char* menuItems[] = {
   "Test Motors",
   "Start Line Follow",
   "LED Color",
-  "PID Tune"
+  "Settings"
 };
 const int menuCount = 5;
 int menuIndex = 0;
@@ -272,8 +276,27 @@ void updateLineFollowLED(bool lineFound) {
 // =====================================================================
 //  BUZZER
 // =====================================================================
+// Deliberately NOT using tone(): on ESP32-S3 it silently shares the same
+// 4 physical LEDC timers as motorsInit()'s PWM. If tone()'s auto-managed
+// timer ever landed on the same timer as a motor channel, keying the
+// buzzer would retune that timer's frequency out from under the motor
+// PWM (audible whine + torque glitch on every beep) or the buzzer would
+// simply fail to get a timer at all and stay silent — which matches
+// "buzzer not working" while everything else on the board is fine.
+// ledcWriteTone() reuses BUZZER_PIN's own explicitly-attached channel
+// (given its own timer in setup(), separate from the 4 motor channels)
+// and is non-blocking; buzzerService() below turns it off after `dur`.
+unsigned long buzzerStopAt = 0;
+
 void beep(int freq = 2000, int dur = 60) {
-  tone(BUZZER_PIN, freq, dur);
+  ledcWriteTone(BUZZER_PIN, freq);
+  buzzerStopAt = millis() + dur;
+}
+void buzzerService() {
+  if (buzzerStopAt && (long)(millis() - buzzerStopAt) >= 0) {
+    ledcWriteTone(BUZZER_PIN, 0);
+    buzzerStopAt = 0;
+  }
 }
 void beepOK()    { beep(2200, 50); }
 void beepBack()  { beep(900, 70); }
@@ -378,12 +401,43 @@ void stopMotors() { setLeftMotor(0); setRightMotor(0); }
 // =====================================================================
 //  PREFERENCES (persist calibration + LED color + PID + line polarity)
 // =====================================================================
-void saveCalibration() {
+// Every save below reads back what it just wrote and compares — a "Save"
+// press now actually PROVES the write landed instead of assuming it did.
+// confirmSaveResult() gives an unmistakable pass/fail beep+flash so you
+// don't need to trust silence: two rising chirps + a green flash means
+// verified-good, one long low buzz + red flash means the write did NOT
+// read back correctly (flash wear-out, NVS corruption, brownout, etc.)
+void confirmSaveResult(bool ok) {
+  RGB restore = colorForState(currentState);
+  if (ok) {
+    beep(2400, 40); delay(70); beep(2700, 40); delay(70);
+    setLED({0, 255, 0}); delay(150);
+  } else {
+    beep(300, 350); delay(370);
+    setLED({255, 0, 0}); delay(350);
+  }
+  setLED(restore);
+}
+
+bool saveCalibration() {
   prefs.begin("linefw", false);
   prefs.putBytes("smin", sensorMin, sizeof(sensorMin));
   prefs.putBytes("smax", sensorMax, sizeof(sensorMax));
   prefs.putBool("invert", lineIsDark);
   prefs.end();
+
+  int chkMin[NUM_SENSORS], chkMax[NUM_SENSORS];
+  prefs.begin("linefw", true);
+  size_t r1 = prefs.getBytes("smin", chkMin, sizeof(chkMin));
+  size_t r2 = prefs.getBytes("smax", chkMax, sizeof(chkMax));
+  bool invertOk = prefs.getBool("invert", !lineIsDark) == lineIsDark;
+  prefs.end();
+
+  bool ok = r1 == sizeof(chkMin) && r2 == sizeof(chkMax) &&
+            memcmp(chkMin, sensorMin, sizeof(chkMin)) == 0 &&
+            memcmp(chkMax, sensorMax, sizeof(chkMax)) == 0 && invertOk;
+  confirmSaveResult(ok);
+  return ok;
 }
 void loadCalibration() {
   prefs.begin("linefw", true);
@@ -395,12 +449,21 @@ void loadCalibration() {
     for (int i = 0; i < NUM_SENSORS; i++) { sensorMin[i] = 4095; sensorMax[i] = 0; }
   }
 }
-void saveLedColor() {
+bool saveLedColor() {
   prefs.begin("linefw", false);
   prefs.putUChar("lr", idleR);
   prefs.putUChar("lg", idleG);
   prefs.putUChar("lb", idleB);
   prefs.end();
+
+  prefs.begin("linefw", true);
+  bool ok = prefs.getUChar("lr", (uint8_t)(idleR ^ 0xFF)) == idleR &&
+            prefs.getUChar("lg", (uint8_t)(idleG ^ 0xFF)) == idleG &&
+            prefs.getUChar("lb", (uint8_t)(idleB ^ 0xFF)) == idleB;
+  prefs.end();
+
+  confirmSaveResult(ok);
+  return ok;
 }
 void loadLedColor() {
   prefs.begin("linefw", true);
@@ -409,20 +472,33 @@ void loadLedColor() {
   idleB = prefs.getUChar("lb", 60);
   prefs.end();
 }
-void savePID() {
+bool saveSettings() {
   prefs.begin("linefw", false);
   prefs.putFloat("kp", Kp);
   prefs.putFloat("ki", Ki);
   prefs.putFloat("kd", Kd);
   prefs.putInt("base", baseSpeed);
+  prefs.putInt("tspd", testSpeed);
   prefs.end();
+
+  prefs.begin("linefw", true);
+  bool ok = prefs.getFloat("kp", Kp + 1) == Kp &&
+            prefs.getFloat("ki", Ki + 1) == Ki &&
+            prefs.getFloat("kd", Kd + 1) == Kd &&
+            prefs.getInt("base", baseSpeed + 1) == baseSpeed &&
+            prefs.getInt("tspd", testSpeed + 1) == testSpeed;
+  prefs.end();
+
+  confirmSaveResult(ok);
+  return ok;
 }
-void loadPID() {
+void loadSettings() {
   prefs.begin("linefw", true);
   Kp = prefs.getFloat("kp", Kp);
   Ki = prefs.getFloat("ki", Ki);
   Kd = prefs.getFloat("kd", Kd);
   baseSpeed = prefs.getInt("base", baseSpeed);
+  testSpeed = prefs.getInt("tspd", testSpeed);
   prefs.end();
 }
 
@@ -535,9 +611,9 @@ void calibrationLoop() {
     display.display();
   }
 
-  if (select()) { // Save & exit
+  if (select()) { // Save & exit — saveCalibration() itself beeps/flashes
+    // the verified pass/fail result, so no extra beepStart() here.
     saveCalibration();
-    beepStart();
     enterState(STATE_MENU);
   }
   if (back()) { // Cancel without saving
@@ -558,7 +634,7 @@ void calibrationLoop() {
 // Forward and reverse share one code path (dir * testSpeed fed to the
 // same setLeftMotor()/setRightMotor() calls for both signs), so there's
 // no separate "reverse" branch to get out of sync between motors.
-int testSpeed = 180;
+// testSpeed lives up in CONSTANTS (needed there by saveSettings/loadSettings)
 MotorTestTarget motorTestTarget = MT_BOTH;
 const char* motorTestTargetName[3] = {"LEFT", "RIGHT", "BOTH"};
 
@@ -591,8 +667,12 @@ void motorTestLoop() {
     lastDraw = millis();
 
     oledHeader("MOTOR TEST");
+    // All three targets always shown, current one bracketed — reachable and
+    // visible on-screen regardless of whether the buzzer/LED cue is heard.
     display.setCursor(0, 12);
-    display.print("Target: "); display.println(motorTestTargetName[motorTestTarget]);
+    display.print(motorTestTarget == MT_LEFT  ? "[L] " : " L  ");
+    display.print(motorTestTarget == MT_RIGHT ? "[R] " : " R  ");
+    display.print(motorTestTarget == MT_BOTH  ? "[BOTH]" : " BOTH ");
     display.setCursor(0, 22);
     display.println(dir > 0 ? "-> FWD" : dir < 0 ? "<- REV" : "-- STOP");
 
@@ -748,39 +828,46 @@ void ledColorLoop() {
 
   setLED({idleR, idleG, idleB}); // live preview
 
-  if (back()) {
+  if (back()) { // saveLedColor() beeps/flashes the verified result itself
     saveLedColor();
-    beepBack();
     enterState(STATE_MENU);
   }
 }
 
 // =====================================================================
-//  MODE: PID TUNE
+//  MODE: SETTINGS  (was "PID Tune"; now also holds the motor-test speed)
 // =====================================================================
-//   UP   = cycle parameter (Kp -> Ki -> Kd -> Base Speed)
+//   UP   = cycle parameter (Kp -> Ki -> Kd -> Base Speed -> Test Speed)
 //   DOWN = decrease
 //   OK   = increase
 //   BACK = save & back
-int pidParamIndex = 0; // 0=Kp,1=Ki,2=Kd,3=BaseSpeed
-const char* pidParamName[4] = {"Kp", "Ki", "Kd", "BaseSpd"};
+int pidParamIndex = 0; // 0=Kp,1=Ki,2=Kd,3=BaseSpeed,4=TestSpeed
+const char* settingsParamName[5] = {"Kp", "Ki", "Kd", "BaseSpd", "TestSpd"};
+const int settingsParamCount = 5;
 
-void pidTuneLoop() {
-  oledHeader("PID TUNE");
+void settingsLoop() {
+  oledHeader("SETTINGS");
   display.setCursor(0, 14);
-  display.print("Param: "); display.println(pidParamName[pidParamIndex]);
-  display.setCursor(0, 24);
-  display.print("Kp="); display.println(Kp, 4);
-  display.setCursor(0, 32);
-  display.print("Ki="); display.println(Ki, 5);
-  display.setCursor(0, 40);
-  display.print("Kd="); display.println(Kd, 4);
-  display.setCursor(0, 48);
-  display.print("Base="); display.println(baseSpeed);
+  display.print("Param: "); display.println(settingsParamName[pidParamIndex]);
+
+  // Big readout of just the selected value — stays legible and scales to
+  // more parameters later without running out of vertical space on a
+  // 64px-tall screen.
+  display.setTextSize(2);
+  display.setCursor(0, 28);
+  switch (pidParamIndex) {
+    case 0: display.println(Kp, 3);        break;
+    case 1: display.println(Ki, 4);        break;
+    case 2: display.println(Kd, 2);        break;
+    case 3: display.println(baseSpeed);    break;
+    case 4: display.println(testSpeed);    break;
+  }
+  display.setTextSize(1);
+
   oledFooter("UP=Param DN/OK=-/+ BK=Sav");
   display.display();
 
-  if (up()) { pidParamIndex = (pidParamIndex + 1) % 4; beep(1800,20); }
+  if (up()) { pidParamIndex = (pidParamIndex + 1) % settingsParamCount; beep(1800,20); }
 
   bool dec = down();
   bool inc = select();
@@ -791,13 +878,13 @@ void pidTuneLoop() {
       case 1: Ki += dir * 0.0001f; Ki = max(0.0f, Ki); break;
       case 2: Kd += dir * 0.02f; Kd = max(0.0f, Kd); break;
       case 3: baseSpeed += dir * 5; baseSpeed = constrain(baseSpeed, 0, 255); break;
+      case 4: testSpeed += dir * 5; testSpeed = constrain(testSpeed, 0, 255); break;
     }
     beep(2000, 20);
   }
 
-  if (back()) {
-    savePID();
-    beepBack();
+  if (back()) { // saveSettings() beeps/flashes the verified result itself
+    saveSettings();
     enterState(STATE_MENU);
   }
 }
@@ -807,6 +894,24 @@ void pidTuneLoop() {
 // =====================================================================
 void setup() {
   Serial.begin(115200);
+
+  // Buzzer + LED are brought up and exercised FIRST, before anything that
+  // could stall setup() (I2C/OLED, motor PWM). If you don't see a white
+  // flash and hear a beep right here at power-on, it's wiring/power on
+  // those two peripherals, not a bug further down in the state machine —
+  // see BUZZER_PIN gets its own explicit LEDC channel (separate from the
+  // 4 motor channels) so beep() below can't be starved by motorsInit().
+  pinMode(BUZZER_PIN, OUTPUT);
+  ledcAttach(BUZZER_PIN, 2000, 8);
+  strip.begin();
+  strip.setBrightness(80);
+  strip.show();
+  setLED({255, 255, 255});
+  beep(1800, 120);
+  delay(150);
+  setLED({0, 0, 0});
+  buzzerService();
+  delay(50);
 
   // Mux pins
   pinMode(MUX_S0, OUTPUT);
@@ -833,14 +938,6 @@ void setup() {
   motorsInit();
   stopMotors();
 
-  // Buzzer
-  pinMode(BUZZER_PIN, OUTPUT);
-
-  // LED
-  strip.begin();
-  strip.setBrightness(80);
-  strip.show();
-
   // OLED
   Wire.begin(OLED_SDA, OLED_SCL);
   Wire.setClock(400000); // fast-mode I2C: keeps display refresh from stealing loop time
@@ -858,7 +955,7 @@ void setup() {
   // Load saved settings
   loadCalibration();
   loadLedColor();
-  loadPID();
+  loadSettings();
 
   applyModeLED();
   beepOK();
@@ -869,6 +966,7 @@ void setup() {
 // =====================================================================
 void loop() {
   updateEncoderRates();
+  buzzerService();
 
   switch (currentState) {
     case STATE_MENU:        handleMenu();      break;
@@ -876,7 +974,7 @@ void loop() {
     case STATE_MOTOR_TEST:  motorTestLoop();   break;
     case STATE_LINE_FOLLOW: lineFollowLoop();  break;
     case STATE_LED_COLOR:   ledColorLoop();    break;
-    case STATE_PID_TUNE:    pidTuneLoop();     break;
+    case STATE_PID_TUNE:    settingsLoop();    break;
   }
   delay(5); // small yield
 }
