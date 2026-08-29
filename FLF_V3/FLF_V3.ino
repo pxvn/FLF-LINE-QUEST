@@ -1,16 +1,28 @@
             /*
   =====================================================================
-  LINE FOLLOWER ROBOT — ESP32-S3 Pico
+  LINE FOLLOWER ROBOT — Waveshare ESP32-S3-Pico
   =====================================================================
   Features:
-    - OLED + 4-button menu UI
-    - Sensor calibration (14x TCRT5000 via CD74HC4067 mux)
-    - Motor test mode (2x N30 motors w/ encoder, BTS7960 drivers)
-    - PID line following
-    - WS2812 RGB LED (x2) that changes color per mode, plus a
-      manually-adjustable "idle" color from the menu
-    - Passive buzzer feedback beeps
-    - Calibration + LED color saved to flash (Preferences/NVS)
+    - OLED + 4-button menu UI (button roles are logical, see "BUTTON
+      HANDLING" below — physical wiring stays fixed, roles are mapped
+      onto it so relabeling the enclosure never means touching every
+      screen's code)
+    - Sensor calibration (14x TCRT5000 via CD74HC4067 mux), with a
+      line-color (dark-on-light / light-on-dark) invert toggle so the
+      PID math can't silently steer backwards on the wrong wiring
+    - Motor test mode: cycle Left/Right/Both, hold to drive fwd/rev,
+      live encoder counts + RPM (or counts/sec if RPM isn't configured)
+      for 2x N30 motors w/ encoder, BTS7960 drivers (~1000 RPM motors)
+    - PID line following, control loop decoupled from the OLED refresh
+      so a slow I2C frame push can't throttle steering reaction time
+    - WS2812 RGB LED (x2): breathing idle color, mode colors, red-flash
+      warning when the line is lost, plus a manually-adjustable idle
+      color from the menu
+    - Passive buzzer feedback beeps, incl. distinct fwd/rev tones in
+      motor test
+    - Calibration + LED color + PID + line polarity saved to flash
+      (Preferences/NVS)
+    - Optional Serial telemetry while line following (DEBUG_SERIAL)
 
   Required libraries (Install via Library Manager):
     - Adafruit GFX Library
@@ -18,12 +30,18 @@
     - Adafruit NeoPixel
     (Preferences.h is built into the ESP32 Arduino core)
 
-  Board: "ESP32S3 Dev Module" (or Waveshare ESP32-S3-Pico variant)
+  Board: Waveshare ESP32-S3-Pico ("ESP32S3 Dev Module")
   Arduino-ESP32 core: 3.x (uses ledcAttach/ledcWrite-by-pin API and tone())
+
+  TODO before trusting Motor Test's RPM readout: set
+  ENCODER_COUNTS_PER_REV below to your encoder's actual counts per
+  output-shaft revolution (quadrature counts x gearbox ratio). Until
+  then the screen shows raw counts/sec, which is always accurate.
   =====================================================================
 */
 
 #include <Wire.h>
+#include <math.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_NeoPixel.h>
@@ -45,6 +63,8 @@ enum State {
   STATE_LED_COLOR,
   STATE_PID_TUNE
 };
+
+enum MotorTestTarget { MT_LEFT, MT_RIGHT, MT_BOTH };
 
 struct RGB { uint8_t r, g, b; };
 
@@ -72,11 +92,12 @@ struct Button {
 #define OLED_W    128
 #define OLED_H    64
 
-// ---- Buttons ----
-#define SW1       10   // UP
-#define SW2       11   // DOWN
-#define SW3       12   // SELECT / OK
-#define SW4       13   // BACK / STOP
+// ---- Buttons (physical pins; logical roles are assigned in the
+//      BUTTON HANDLING section below, not here) ----
+#define SW1       10
+#define SW2       11
+#define SW3       12
+#define SW4       13
 
 // ---- Right Motor Driver (BTS7960) ----
 #define R_RPWM    15   // "PWMR"
@@ -107,6 +128,15 @@ const uint8_t muxChannelForSensor[NUM_SENSORS] = {0,1,2,3,4,5,6,7,8,9,10,11,12,1
 
 #define PWM_FREQ  20000
 #define PWM_RES   8      // 0-255
+
+// Set to your encoder's counts per output-shaft revolution (quadrature
+// counts x gear ratio) to get real RPM in Motor Test. 0 = unknown -> the
+// screen falls back to raw counts/sec, which needs no calibration.
+const int ENCODER_COUNTS_PER_REV = 0;
+
+// Print err/L/R/lineFound over Serial while line following (115200 baud),
+// throttled to the same rate as the OLED. Handy for PID tuning.
+#define DEBUG_SERIAL 1
 
 // PID defaults (tune from the "PID Tune" submenu, or edit here)
 float Kp = 0.06;
@@ -147,7 +177,14 @@ int menuIndex = 0;
 int sensorRaw[NUM_SENSORS];
 int sensorMin[NUM_SENSORS];
 int sensorMax[NUM_SENSORS];
-int sensorNorm[NUM_SENSORS]; // 0-1000 normalized
+int sensorNorm[NUM_SENSORS]; // 0-1000 normalized, hi (calibrated max) -> 1000
+
+// True: sensors read HIGHER raw values over the line than over the
+// background (so a higher sensorNorm means "closer to the line").
+// False: inverted wiring/reflectance -> the line reads LOWER. Toggle
+// with UP while calibrating and watch "Line: OK/LOST" over the actual
+// line to pick the right setting; it's persisted to flash.
+bool lineIsDark = true;
 
 // =====================================================================
 //  ENCODER COUNTS
@@ -162,6 +199,31 @@ void IRAM_ATTR leftEncoderISR() {
 void IRAM_ATTR rightEncoderISR() {
   bool b = digitalRead(R_ENC_B);
   if (b) rightEncCount++; else rightEncCount--;
+}
+
+// Encoder rate tracking (updated ~10x/sec from loop(), read by Motor Test)
+long lastLeftEncForRate = 0, lastRightEncForRate = 0;
+unsigned long lastRateCalc = 0;
+float leftCPS = 0, rightCPS = 0;   // counts per second (always valid)
+float leftRPM = 0, rightRPM = 0;   // only meaningful if ENCODER_COUNTS_PER_REV is set
+
+void updateEncoderRates() {
+  unsigned long now = millis();
+  unsigned long dt = now - lastRateCalc;
+  if (dt < 100) return; // ~10 Hz
+  long dl = leftEncCount - lastLeftEncForRate;
+  long dr = rightEncCount - lastRightEncForRate;
+  lastLeftEncForRate = leftEncCount;
+  lastRightEncForRate = rightEncCount;
+  lastRateCalc = now;
+
+  float dtSec = dt / 1000.0f;
+  leftCPS = dl / dtSec;
+  rightCPS = dr / dtSec;
+  if (ENCODER_COUNTS_PER_REV > 0) {
+    leftRPM = (leftCPS / ENCODER_COUNTS_PER_REV) * 60.0f;
+    rightRPM = (rightCPS / ENCODER_COUNTS_PER_REV) * 60.0f;
+  }
 }
 
 // =====================================================================
@@ -185,6 +247,27 @@ void setLED(RGB c) {
   strip.show();
 }
 void applyModeLED() { setLED(colorForState(currentState)); }
+
+// Slow "breathing" idle color so the menu doesn't look static. Call every
+// loop while in STATE_MENU; throttled internally.
+void updateIdleBreath() {
+  static unsigned long lastUpdate = 0;
+  if (millis() - lastUpdate < 30) return;
+  lastUpdate = millis();
+  float phase = (millis() % 3000) / 3000.0f * TWO_PI;
+  float b = 0.25f + (sinf(phase) * 0.5f + 0.5f) * 0.75f; // 0.25..1.0
+  setLED({(uint8_t)(idleR * b), (uint8_t)(idleG * b), (uint8_t)(idleB * b)});
+}
+
+// Solid green while the line is seen, flashing red while it's lost —
+// call every loop from lineFollowLoop(); throttled internally.
+void updateLineFollowLED(bool lineFound) {
+  if (lineFound) { setLED({0, 255, 0}); return; }
+  static bool flashOn = false;
+  static unsigned long lastFlash = 0;
+  if (millis() - lastFlash > 150) { flashOn = !flashOn; lastFlash = millis(); }
+  setLED(flashOn ? RGB{255, 0, 0} : RGB{0, 0, 0});
+}
 
 // =====================================================================
 //  BUZZER
@@ -220,10 +303,21 @@ bool wasPressed(Button &b) {
   return pressedEdge;
 }
 
-bool up()     { return wasPressed(btn1); }
-bool down()   { return wasPressed(btn2); }
-bool select() { return wasPressed(btn3); }
-bool back()   { return wasPressed(btn4); }
+// ---- Logical roles, mapped onto physical buttons here (and ONLY here).
+// Physical wiring: SW1, SW2, SW3, SW4. Current layout rotates the roles
+// one step around the enclosure: SW1->BACK, SW2->UP, SW3->OK (unchanged),
+// SW4->DOWN. Every screen below calls up()/down()/select()/back() by
+// role, never by SWx, so the physical layout can change again by editing
+// only this block.
+bool up()     { return wasPressed(btn2); }  // physical SW2
+bool down()   { return wasPressed(btn4); }  // physical SW4
+bool select() { return wasPressed(btn3); }  // physical SW3
+bool back()   { return wasPressed(btn1); }  // physical SW1
+
+// Raw (non-edge-triggered) hold state for the same UP/DOWN roles, used by
+// Motor Test's hold-to-drive controls.
+bool upHeld()   { return digitalRead(SW2) == LOW; }
+bool downHeld() { return digitalRead(SW4) == LOW; }
 
 // =====================================================================
 //  MULTIPLEXER / SENSOR READING
@@ -252,6 +346,13 @@ void normalizeSensors() {
   }
 }
 
+// "How much this sensor thinks it's on the line", 0-1000, correcting for
+// wiring polarity via lineIsDark so the PID math always weights toward
+// the line regardless of which way the calibrated min/max fell.
+int lineWeight(int i) {
+  return lineIsDark ? sensorNorm[i] : (1000 - sensorNorm[i]);
+}
+
 // =====================================================================
 //  MOTOR CONTROL (BTS7960: separate forward/reverse PWM pins, no EN)
 // =====================================================================
@@ -275,18 +376,20 @@ void setLeftMotor(int speed) { // -255..255
 void stopMotors() { setLeftMotor(0); setRightMotor(0); }
 
 // =====================================================================
-//  PREFERENCES (persist calibration + LED color)
+//  PREFERENCES (persist calibration + LED color + PID + line polarity)
 // =====================================================================
 void saveCalibration() {
   prefs.begin("linefw", false);
   prefs.putBytes("smin", sensorMin, sizeof(sensorMin));
   prefs.putBytes("smax", sensorMax, sizeof(sensorMax));
+  prefs.putBool("invert", lineIsDark);
   prefs.end();
 }
 void loadCalibration() {
   prefs.begin("linefw", true);
   size_t r1 = prefs.getBytes("smin", sensorMin, sizeof(sensorMin));
   size_t r2 = prefs.getBytes("smax", sensorMax, sizeof(sensorMax));
+  lineIsDark = prefs.getBool("invert", true);
   prefs.end();
   if (r1 != sizeof(sensorMin) || r2 != sizeof(sensorMax)) {
     for (int i = 0; i < NUM_SENSORS; i++) { sensorMin[i] = 4095; sensorMax[i] = 0; }
@@ -335,6 +438,15 @@ void oledHeader(const char* title) {
   display.drawLine(0, 10, OLED_W, 10, SSD1306_WHITE);
 }
 
+// One line of button-hint text, opaque background so it stays readable
+// over other content.
+void oledFooter(const char* hint) {
+  display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+  display.setCursor(0, 56);
+  display.print(hint);
+  display.setTextColor(SSD1306_WHITE);
+}
+
 // =====================================================================
 //  MODE: MENU
 // =====================================================================
@@ -347,14 +459,16 @@ void enterState(State s) {
 void drawMenu() {
   oledHeader("MAIN MENU");
   for (int i = 0; i < menuCount; i++) {
-    display.setCursor(2, 14 + i * 10);
+    display.setCursor(2, 12 + i * 9);
     display.print(i == menuIndex ? "> " : "  ");
     display.println(menuItems[i]);
   }
+  oledFooter("UP/DN Move  OK Select");
   display.display();
 }
 
 void handleMenu() {
+  updateIdleBreath();
   drawMenu();
   if (up())   { menuIndex = (menuIndex - 1 + menuCount) % menuCount; beep(1800, 30); }
   if (down()) { menuIndex = (menuIndex + 1) % menuCount; beep(1800, 30); }
@@ -378,43 +492,48 @@ void calibrationLoop() {
     calibResetFlag = false;
   }
 
+  // Sensor read + min/max tracking run every loop (cheap) so calibration
+  // never misses a peak, even though the display below is throttled.
   readAllSensors();
   for (int i = 0; i < NUM_SENSORS; i++) {
     if (sensorRaw[i] < sensorMin[i]) sensorMin[i] = sensorRaw[i];
     if (sensorRaw[i] > sensorMax[i]) sensorMax[i] = sensorRaw[i];
   }
 
-  oledHeader("CALIBRATING");
+  if (up()) { lineIsDark = !lineIsDark; beep(1700, 20); }
 
-  // ---- per-sensor bar visualizer (one bar per sensor, live) ----
-  const int barTop    = 12;             // just under the header line
-  const int barBottom = OLED_H;         // 64
-  const int barMaxH   = barBottom - barTop;
-  int slot = OLED_W / NUM_SENSORS;      // ~9px per sensor on a 128-wide display
-  if (slot < 6) slot = 6;
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw >= 40) {
+    lastDraw = millis();
 
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    int lo = sensorMin[i], hi = sensorMax[i];
-    int h = 0;
-    if (hi > lo) {
-      int v = constrain(sensorRaw[i], lo, hi);
-      h = map(v, lo, hi, 0, barMaxH);
+    oledHeader("CALIBRATING");
+    display.setCursor(86, 0);
+    display.print(lineIsDark ? "DARK" : "LITE");
+
+    // ---- per-sensor bar visualizer (one bar per sensor, live) ----
+    const int barTop    = 12;             // just under the header line
+    const int barBottom = OLED_H;         // 64
+    const int barMaxH   = barBottom - barTop;
+    int slot = OLED_W / NUM_SENSORS;      // ~9px per sensor on a 128-wide display
+    if (slot < 6) slot = 6;
+
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      int lo = sensorMin[i], hi = sensorMax[i];
+      int h = 0;
+      if (hi > lo) {
+        int v = constrain(sensorRaw[i], lo, hi);
+        h = map(v, lo, hi, 0, barMaxH);
+      }
+      int x = i * slot;
+      int w = slot - 2;
+      if (w < 2) w = 2;
+      display.drawRect(x, barTop, w, barMaxH, SSD1306_WHITE);          // outline
+      display.fillRect(x + 1, barBottom - h, max(w - 2, 1), h, SSD1306_WHITE); // fill from bottom
     }
-    int x = i * slot;
-    int w = slot - 2;
-    if (w < 2) w = 2;
-    display.drawRect(x, barTop, w, barMaxH, SSD1306_WHITE);          // outline
-    display.fillRect(x + 1, barBottom - h, max(w - 2, 1), h, SSD1306_WHITE); // fill from bottom
+
+    oledFooter("OK=Save BK=Cancel UP=Inv");
+    display.display();
   }
-
-  // Instructions drawn with an opaque background so they stay readable
-  // even when overlapping a tall bar.
-  display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-  display.setCursor(0, 56);
-  display.print("SW3=Save  SW4=Cancel");
-  display.setTextColor(SSD1306_WHITE);
-
-  display.display();
 
   if (select()) { // Save & exit
     saveCalibration();
@@ -431,32 +550,65 @@ void calibrationLoop() {
 // =====================================================================
 //  MODE: MOTOR TEST
 // =====================================================================
-// SW1/SW2 = left motor reverse/forward while held (simple pulse test)
-// SW3 = pulse both motors forward briefly
-// SW4 = back to menu
+// OK    = cycle target (Left / Right / Both)
+// UP    = hold to drive target forward
+// DOWN  = hold to drive target reverse
+// BACK  = stop & return to menu
+//
+// Forward and reverse share one code path (dir * testSpeed fed to the
+// same setLeftMotor()/setRightMotor() calls for both signs), so there's
+// no separate "reverse" branch to get out of sync between motors.
 int testSpeed = 180;
+MotorTestTarget motorTestTarget = MT_BOTH;
+const char* motorTestTargetName[3] = {"LEFT", "RIGHT", "BOTH"};
 
 void motorTestLoop() {
-  oledHeader("MOTOR TEST");
-  display.setCursor(0, 14);
-  display.print("L enc: "); display.println(leftEncCount);
-  display.setCursor(0, 24);
-  display.print("R enc: "); display.println(rightEncCount);
-  display.setCursor(0, 36);
-  display.println("SW1=L  SW2=R  SW3=Both");
-  display.setCursor(0, 46);
-  display.println("SW4=Back");
-  display.display();
+  updateEncoderRates();
 
-  // Hold-to-run: read raw pin state directly for responsive testing
-  bool p1 = digitalRead(SW1) == LOW;
-  bool p2 = digitalRead(SW2) == LOW;
-  bool p3 = digitalRead(SW3) == LOW;
+  if (select()) {
+    motorTestTarget = (MotorTestTarget)((motorTestTarget + 1) % 3);
+    beep(2200, 20);
+  }
 
-  setLeftMotor(p1 ? testSpeed : 0);
-  setRightMotor(p2 ? testSpeed : 0);
-  if (p3) { setLeftMotor(testSpeed); setRightMotor(testSpeed); }
-  if (!p1 && !p2 && !p3) stopMotors();
+  bool fwdHeld = upHeld();
+  bool revHeld = downHeld();
+  int dir = fwdHeld ? 1 : (revHeld ? -1 : 0);
+
+  static bool wasDriving = false;
+  bool driving = (dir != 0);
+  if (driving && !wasDriving) beep(dir > 0 ? 1300 : 700, 40); // direction cue on press
+  wasDriving = driving;
+
+  int cmd = dir * testSpeed;
+  switch (motorTestTarget) {
+    case MT_LEFT:  setLeftMotor(cmd); setRightMotor(0);   break;
+    case MT_RIGHT: setLeftMotor(0);   setRightMotor(cmd); break;
+    case MT_BOTH:  setLeftMotor(cmd); setRightMotor(cmd); break;
+  }
+
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw >= 50) {
+    lastDraw = millis();
+
+    oledHeader("MOTOR TEST");
+    display.setCursor(0, 12);
+    display.print("Target: "); display.println(motorTestTargetName[motorTestTarget]);
+    display.setCursor(0, 22);
+    display.println(dir > 0 ? "-> FWD" : dir < 0 ? "<- REV" : "-- STOP");
+
+    display.setCursor(0, 34);
+    display.print("L "); display.print(leftEncCount); display.print("  ");
+    if (ENCODER_COUNTS_PER_REV > 0) { display.print(leftRPM, 0); display.println("rpm"); }
+    else { display.print(leftCPS, 0); display.println("cps"); }
+
+    display.setCursor(0, 44);
+    display.print("R "); display.print(rightEncCount); display.print("  ");
+    if (ENCODER_COUNTS_PER_REV > 0) { display.print(rightRPM, 0); display.println("rpm"); }
+    else { display.print(rightCPS, 0); display.println("cps"); }
+
+    oledFooter("OK=Target UP/DN=Drive");
+    display.display();
+  }
 
   if (back()) {
     stopMotors();
@@ -477,6 +629,14 @@ long sensorPosition(int i) {
   return (long)i * 1000L - 6500L;
 }
 
+const char* directionArrow(int left, int right) {
+  if (left > right + 10) return "<<<";
+  if (right > left + 10) return ">>>";
+  if (left > 0)          return "^^^";
+  if (left < 0)           return "vvv";
+  return "---";
+}
+
 void lineFollowLoop() {
   if (lineFollowStarting) {
     pidIntegral = 0;
@@ -491,8 +651,9 @@ void lineFollowLoop() {
   long weightedSum = 0;
   long sum = 0;
   for (int i = 0; i < NUM_SENSORS; i++) {
-    weightedSum += (long)sensorNorm[i] * sensorPosition(i);
-    sum += sensorNorm[i];
+    int w = lineWeight(i);
+    weightedSum += (long)w * sensorPosition(i);
+    sum += w;
   }
 
   bool lineFound = sum > (long)(NUM_SENSORS * 30); // threshold: something detected
@@ -505,8 +666,14 @@ void lineFollowLoop() {
     if (millis() - lastLineLostBeep > 500) { beepError(); lastLineLostBeep = millis(); }
   }
 
-  pidIntegral += error;
-  pidIntegral = constrain(pidIntegral, -50000, 50000);
+  // Only accumulate the integral term while actually on the line — while
+  // searching, `error` is pinned to +-6500 every tick, which would slam
+  // the integral into its clamp almost instantly and cause a hard
+  // overshoot the moment the line is reacquired.
+  if (lineFound) {
+    pidIntegral += error;
+    pidIntegral = constrain(pidIntegral, -50000, 50000);
+  }
   float derivative = error - pidLastError;
   float output = Kp * error + Ki * pidIntegral + Kd * derivative;
   pidLastError = error;
@@ -516,17 +683,32 @@ void lineFollowLoop() {
   setLeftMotor(constrain(left, -255, 255));
   setRightMotor(constrain(right, -255, 255));
 
-  oledHeader("LINE FOLLOWING");
-  display.setCursor(0, 14);
-  display.print("Err: "); display.println((int)error);
-  display.setCursor(0, 24);
-  display.print("L:"); display.print(left);
-  display.print("  R:"); display.println(right);
-  display.setCursor(0, 40);
-  display.println(lineFound ? "Line: OK" : "Line: LOST");
-  display.setCursor(0, 52);
-  display.println("SW4 = Stop");
-  display.display();
+  updateLineFollowLED(lineFound);
+
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw >= 50) { // ~20 Hz screen refresh, decoupled from the PID loop above
+    lastDraw = millis();
+
+    oledHeader("LINE FOLLOWING");
+    display.setCursor(0, 14);
+    display.print("Err: "); display.println((int)error);
+    display.setCursor(0, 24);
+    display.print("L:"); display.print(left);
+    display.print("  R:"); display.print(right);
+    display.setCursor(90, 24);
+    display.print(directionArrow(left, right));
+    display.setCursor(0, 40);
+    display.println(lineFound ? "Line: OK" : "Line: LOST");
+    oledFooter("BACK = Stop");
+    display.display();
+
+#if DEBUG_SERIAL
+    Serial.print("err="); Serial.print(error);
+    Serial.print(" L="); Serial.print(left);
+    Serial.print(" R="); Serial.print(right);
+    Serial.print(" found="); Serial.println(lineFound ? 1 : 0);
+#endif
+  }
 
   if (back()) {
     stopMotors();
@@ -538,12 +720,10 @@ void lineFollowLoop() {
 // =====================================================================
 //  MODE: LED COLOR PICKER
 // =====================================================================
-// SW1 = cycle channel (R->G->B), SW2 = increase value, SW3 = decrease,
-// wait — clearer mapping below:
-//   SW1 = -10 on selected channel
-//   SW2 = +10 on selected channel
-//   SW3 = switch channel (R/G/B) & SAVE when cycled past B
-//   SW4 = back without extra save (still keeps last saved value)
+//   UP   = -10 on selected channel
+//   DOWN = +10 on selected channel
+//   OK   = switch channel (R/G/B)
+//   BACK = save & back
 int ledChannel = 0; // 0=R,1=G,2=B
 const char* ledChannelName[3] = {"R", "G", "B"};
 
@@ -555,10 +735,9 @@ void ledColorLoop() {
   display.print("R:"); display.print(idleR);
   display.print(" G:"); display.print(idleG);
   display.print(" B:"); display.println(idleB);
-  display.setCursor(0, 40);
-  display.println("SW1=- SW2=+ SW3=Next");
-  display.setCursor(0, 50);
-  display.println("SW4=Save & Back");
+  oledFooter("UP=- DN=+ OK=Next");
+  display.setCursor(0, 46);
+  display.println("BACK=Save & Back");
   display.display();
 
   uint8_t* chan = (ledChannel == 0) ? &idleR : (ledChannel == 1) ? &idleG : &idleB;
@@ -579,11 +758,10 @@ void ledColorLoop() {
 // =====================================================================
 //  MODE: PID TUNE
 // =====================================================================
-// SW1/SW2 select parameter, SW3 decreases, hold pattern kept simple:
-//   SW1 = cycle parameter (Kp -> Ki -> Kd -> Base Speed)
-//   SW2 = decrease
-//   SW3 = increase
-//   SW4 = save & back
+//   UP   = cycle parameter (Kp -> Ki -> Kd -> Base Speed)
+//   DOWN = decrease
+//   OK   = increase
+//   BACK = save & back
 int pidParamIndex = 0; // 0=Kp,1=Ki,2=Kd,3=BaseSpeed
 const char* pidParamName[4] = {"Kp", "Ki", "Kd", "BaseSpd"};
 
@@ -599,6 +777,7 @@ void pidTuneLoop() {
   display.print("Kd="); display.println(Kd, 4);
   display.setCursor(0, 48);
   display.print("Base="); display.println(baseSpeed);
+  oledFooter("UP=Param DN/OK=-/+ BK=Sav");
   display.display();
 
   if (up()) { pidParamIndex = (pidParamIndex + 1) % 4; beep(1800,20); }
@@ -664,6 +843,7 @@ void setup() {
 
   // OLED
   Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000); // fast-mode I2C: keeps display refresh from stealing loop time
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     // OLED failed - blink LED red as an error indicator, halt is avoided
     // so the robot doesn't become unusable; just flag on screen retries.
@@ -688,6 +868,8 @@ void setup() {
 //  LOOP
 // =====================================================================
 void loop() {
+  updateEncoderRates();
+
   switch (currentState) {
     case STATE_MENU:        handleMenu();      break;
     case STATE_CALIBRATION: calibrationLoop(); break;
