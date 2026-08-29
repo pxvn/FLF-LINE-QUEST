@@ -169,6 +169,11 @@ int testSpeed = 180;     // 0-255, manual jog speed used by Motor Test; tune
                           // it from the Settings screen (adjustable there
                           // as its own parameter, see "TestSpd")
 
+int uTurnMinMs = 600;    // blind-pivot duration for the checkpoint U-turn: sensors are
+                          // ignored entirely until this elapses, so the checkpoint's own
+                          // crossing mark can't abort the turn a few degrees in. Tune from
+                          // Settings ("UturnMs") until the pivot lands a true ~180.
+
 const int ON_THRESH = 500; // per-sensor lineWeight() above this = "on line";
                             // used by calibration's live tick row and by
                             // junction edge-sensing below
@@ -524,6 +529,7 @@ bool saveSettings() {
   prefs.putInt("base", baseSpeed);
   prefs.putInt("tspd", testSpeed);
   prefs.putBool("tpleft", turnPriorityLeft);
+  prefs.putInt("utms", uTurnMinMs);
   prefs.end();
 
   prefs.begin("linefw", true);
@@ -532,7 +538,8 @@ bool saveSettings() {
             prefs.getFloat("kd", Kd + 1) == Kd &&
             prefs.getInt("base", baseSpeed + 1) == baseSpeed &&
             prefs.getInt("tspd", testSpeed + 1) == testSpeed &&
-            prefs.getBool("tpleft", !turnPriorityLeft) == turnPriorityLeft;
+            prefs.getBool("tpleft", !turnPriorityLeft) == turnPriorityLeft &&
+            prefs.getInt("utms", uTurnMinMs + 1) == uTurnMinMs;
   prefs.end();
 
   confirmSaveResult(ok);
@@ -546,6 +553,7 @@ void loadSettings() {
   baseSpeed = prefs.getInt("base", baseSpeed);
   testSpeed = prefs.getInt("tspd", testSpeed);
   turnPriorityLeft = prefs.getBool("tpleft", turnPriorityLeft);
+  uTurnMinMs = prefs.getInt("utms", uTurnMinMs);
   prefs.end();
 }
 
@@ -832,11 +840,26 @@ unsigned long endZoneSince = 0;  // 0 = not currently seeing a wide block
 // side (as opposed to a real branch, where an edge lit up recently) means
 // the track genuinely stops here -- per the arena, that's a checkpoint
 // marker and the correct move is a controlled 180, not a guessed corner
-// turn. Bounded by UTURN_MAX_MS as a safety net (line reacquired sooner
-// always wins).
+// turn.
+//
+// uTurnMinMs is the important one: the checkpoint's own crossing mark
+// sweeps under the sensors almost immediately once the pivot starts, so
+// checking for "line reacquired" from the very first instant made this
+// stop after a few degrees instead of completing the turn -- exactly the
+// bug reported ("unable to take a U-turn... as it should"). The STM
+// reference's TURN_AROUND phase sidesteps this entirely: it's a BLIND,
+// fixed-duration pivot that ignores the sensors completely until the
+// phase timer is up. Same fix here: sensor reacquisition is ignored for
+// the first uTurnMinMs no matter what the checkpoint mark does, only
+// checked after that. uTurnMinMs is a guess (600ms @ UTURN_SPEED) --
+// tune it on the real arena until the pivot actually reads as ~180
+// degrees; it's the single most important constant in this file.
 bool uTurning = false;
 unsigned long uTurnStart = 0;
-const unsigned long UTURN_MAX_MS = 1500;
+// uTurnMinMs lives up with the other tunables (it's adjustable from
+// Settings as "UturnMs" -- it needs on-arena calibration to land a true
+// 180, so it shouldn't require a reflash to change).
+const unsigned long UTURN_MAX_MS = 2500; // safety cap if the line is never seen again
 const int UTURN_SPEED = 130;
 
 void lineFollowLoop() {
@@ -866,14 +889,20 @@ void lineFollowLoop() {
   readAllSensors();
   normalizeSensors();
 
-  // Mid-U-turn: spin in place until the line reappears under any sensor,
-  // or UTURN_MAX_MS elapses as a safety net. This bypasses the PID/error
-  // path entirely -- it's a fixed maneuver, not a steered one.
+  // Mid-U-turn: blind pivot for the first uTurnMinMs (sensors ignored
+  // completely, same as the STM reference's fixed-duration TURN_AROUND),
+  // THEN look for the line reappearing under any sensor, up to UTURN_MAX_MS
+  // as a safety net. This bypasses the PID/error path entirely -- it's a
+  // fixed maneuver, not a steered one.
   if (uTurning) {
-    long checkSum = 0;
-    for (int i = 0; i < NUM_SENSORS; i++) checkSum += lineWeight(i);
-    bool reacquired = checkSum > (long)(NUM_SENSORS * 30);
-    if (reacquired || millis() - uTurnStart > UTURN_MAX_MS) {
+    unsigned long uElapsed = millis() - uTurnStart;
+    bool reacquired = false;
+    if (uElapsed >= uTurnMinMs) {
+      long checkSum = 0;
+      for (int i = 0; i < NUM_SENSORS; i++) checkSum += lineWeight(i);
+      reacquired = checkSum > (long)(NUM_SENSORS * 30);
+    }
+    if (reacquired || uElapsed > UTURN_MAX_MS) {
       uTurning = false;
       lineLostSince = 0;
       pidLastError = 0; // avoid a derivative kick from whatever error existed before the turn
@@ -886,7 +915,7 @@ void lineFollowLoop() {
         lastUDraw = millis();
         oledHeader("LINE FOLLOWING");
         display.setCursor(0, 24);
-        display.println("U-TURN (checkpoint)");
+        display.println(uElapsed < uTurnMinMs ? "U-TURN (blind)" : "U-TURN (checking)");
         oledFooter("BACK = Stop");
         display.display();
       }
@@ -1103,9 +1132,9 @@ void ledColorLoop() {
 //   DOWN = decrease
 //   OK   = increase
 //   BACK = save & back
-int pidParamIndex = 0; // 0=Kp,1=Ki,2=Kd,3=BaseSpeed,4=TestSpeed,5=TurnPriority
-const char* settingsParamName[6] = {"Kp", "Ki", "Kd", "BaseSpd", "TestSpd", "TurnPri"};
-const int settingsParamCount = 6;
+int pidParamIndex = 0; // 0=Kp,1=Ki,2=Kd,3=BaseSpeed,4=TestSpeed,5=TurnPriority,6=UturnMs
+const char* settingsParamName[7] = {"Kp", "Ki", "Kd", "BaseSpd", "TestSpd", "TurnPri", "UturnMs"};
+const int settingsParamCount = 7;
 
 void settingsLoop() {
   oledHeader("SETTINGS");
@@ -1124,6 +1153,7 @@ void settingsLoop() {
     case 3: display.println(baseSpeed);    break;
     case 4: display.println(testSpeed);    break;
     case 5: display.println(turnPriorityLeft ? "LEFT" : "RIGHT"); break;
+    case 6: display.println(uTurnMinMs);   break;
   }
   display.setTextSize(1);
 
@@ -1143,6 +1173,7 @@ void settingsLoop() {
       case 3: baseSpeed += dir * 25; baseSpeed = constrain(baseSpeed, 0, 255); break;
       case 4: testSpeed += dir * 25; testSpeed = constrain(testSpeed, 0, 255); break;
       case 5: turnPriorityLeft = !turnPriorityLeft; break; // binary -- either DN or OK just flips it
+      case 6: uTurnMinMs += dir * 50; uTurnMinMs = constrain(uTurnMinMs, 0, 2000); break;
     }
     beep(2000, 20);
   }
