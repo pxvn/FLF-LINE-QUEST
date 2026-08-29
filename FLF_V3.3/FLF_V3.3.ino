@@ -1,4 +1,4 @@
-            /*
+              /*
   =====================================================================
   LINE FOLLOWER ROBOT — Waveshare ESP32-S3-Pico  (V3.3: maze arena pass)
   =====================================================================
@@ -820,6 +820,17 @@ unsigned long lineLostSince = 0; // 0 = currently on the line
 bool endZoneReached = false;
 unsigned long endZoneSince = 0;  // 0 = not currently seeing a wide block
 
+// ---- Checkpoint U-turn: a dead end with NO edge-sensor evidence on either
+// side (as opposed to a real branch, where an edge lit up recently) means
+// the track genuinely stops here -- per the arena, that's a checkpoint
+// marker and the correct move is a controlled 180, not a guessed corner
+// turn. Bounded by UTURN_MAX_MS as a safety net (line reacquired sooner
+// always wins).
+bool uTurning = false;
+unsigned long uTurnStart = 0;
+const unsigned long UTURN_MAX_MS = 1500;
+const int UTURN_SPEED = 130;
+
 void lineFollowLoop() {
   if (lineFollowStarting) {
     pidIntegral = 0;
@@ -846,6 +857,35 @@ void lineFollowLoop() {
 
   readAllSensors();
   normalizeSensors();
+
+  // Mid-U-turn: spin in place until the line reappears under any sensor,
+  // or UTURN_MAX_MS elapses as a safety net. This bypasses the PID/error
+  // path entirely -- it's a fixed maneuver, not a steered one.
+  if (uTurning) {
+    long checkSum = 0;
+    for (int i = 0; i < NUM_SENSORS; i++) checkSum += lineWeight(i);
+    bool reacquired = checkSum > (long)(NUM_SENSORS * 30);
+    if (reacquired || millis() - uTurnStart > UTURN_MAX_MS) {
+      uTurning = false;
+      lineLostSince = 0;
+      pidLastError = 0; // avoid a derivative kick from whatever error existed before the turn
+    } else {
+      setLeftMotor(-UTURN_SPEED);
+      setRightMotor(UTURN_SPEED);
+      updateLineFollowLED(false);
+      static unsigned long lastUDraw = 0;
+      if (millis() - lastUDraw >= 50) {
+        lastUDraw = millis();
+        oledHeader("LINE FOLLOWING");
+        display.setCursor(0, 24);
+        display.println("U-TURN (checkpoint)");
+        oledFooter("BACK = Stop");
+        display.display();
+      }
+      if (back()) { stopMotors(); uTurning = false; beepBack(); enterState(STATE_MENU); }
+      return;
+    }
+  }
 
   // weightedSum/rawSum use the true sensor weight for detection & End Zone
   // sizing; gainedSum applies EDGE_GAIN on top for the error CALCULATION
@@ -894,13 +934,21 @@ void lineFollowLoop() {
       // Coast straight first -- most junction crossings and gaps resolve
       // here with zero turn decision made.
       error = 0;
-    } else {
-      // Truly lost: commit to a turn using which outer group saw the line
-      // most recently, not a hardcoded side and not just "last drift".
-      if (lastEdgeDir > 0)      error = 6500;
-      else if (lastEdgeDir < 0) error = -6500;
-      else                       error = (pidLastError >= 0) ? 6500 : -6500; // never saw either edge yet
+    } else if (lastEdgeDir != 0) {
+      // Real branch/corner: an edge sensor lit up on the way in, so steer
+      // hard toward that side (not a hardcoded side, not a coin flip).
+      error = (lastEdgeDir > 0) ? 6500 : -6500;
       if (millis() - lastLineLostBeep > 500) { beepError(); lastLineLostBeep = millis(); }
+    } else {
+      // Neither edge ever saw anything on the way in: the track just
+      // stops here -- a checkpoint dead end, not a branch. Controlled
+      // 180 in place, not a guessed corner turn.
+      uTurning = true;
+      uTurnStart = millis();
+      beep(1000, 100);
+      setLeftMotor(-UTURN_SPEED);
+      setRightMotor(UTURN_SPEED);
+      return;
     }
   }
 
