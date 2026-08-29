@@ -162,19 +162,18 @@ int testSpeed = 180;     // 0-255, manual jog speed used by Motor Test; tune
                           // it from the Settings screen (adjustable there
                           // as its own parameter, see "TestSpd")
 
-// ---- Junction / line-lost navigation (see NAV_* in MODE: LINE FOLLOW) ----
-const int ON_THRESH = 500;        // per-sensor lineWeight() above this = "on line"
-const int JUNCTION_ON_COUNT = 7;  // this many sensors on at once = cross/T/wide marker
-const long CREEP_TICKS = 40;      // encoder ticks to creep straight before deciding
+// ---- Line-lost navigation (see NAV_* in MODE: LINE FOLLOW) ----
+const int ON_THRESH = 500;        // per-sensor lineWeight() above this = "on line";
+                                   // used for calibration's live tick row and to
+                                   // decide which side has a branch during a search
 const long TRY_TICKS = 90;        // encoder ticks to try one turn direction before
                                    // falling through to the next priority option
 const unsigned long NAV_PHASE_TIMEOUT_MS = 1500; // hard time ceiling per attempt, in
                                    // case of wheel slip (encoder ticks can't be
                                    // trusted alone if the wheels aren't gripping)
-const int NAV_TURN_SPEED = 110;   // reduced, traction-friendly speed for creep/turn
+const int NAV_TURN_SPEED = 110;   // reduced, traction-friendly speed while searching
 
 // ---- Corner-aware speed profiling ----
-const int MOTOR_RAMP_STEP = 25;   // max change in commanded PWM per loop tick (~5ms)
 const int MIN_CRUISE_FRACTION = 2; // dynamic cruise speed never drops below baseSpeed/this
 
 // =====================================================================
@@ -762,50 +761,45 @@ const char* directionArrow(int left, int right) {
   return "---";
 }
 
-// ---- Junction / line-lost navigation state machine ----
-// NAV_TRACK : normal weighted-average PID tracking (unchanged algorithm).
-// NAV_CREEP : entered the instant we see either a junction-wide sensor
-//             pattern OR the line vanish. We do NOT pick a direction yet —
-//             creep straight, bounded by CREEP_TICKS of actual wheel
-//             movement, and keep re-reading sensors. Most crossings and
-//             momentary gaps resolve themselves right here with zero turn
-//             decision made, which is the fix for "guesses a direction
-//             when something disappears": most of the time nothing needs
-//             to be guessed at all.
-// NAV_TRY   : straight didn't pan out within CREEP_TICKS -> now make an
-//             actual decision, walking the fixed priority Left -> Right ->
-//             U-turn (Straight was already tried in NAV_CREEP). Each
-//             attempt is bounded by TRY_TICKS of wheel movement AND a
-//             time ceiling (NAV_PHASE_TIMEOUT_MS, in case of wheel slip —
-//             see "traction" below), and is abandoned the instant either
-//             bound is hit in favor of the next priority direction. This
-//             is the whole point: never a fixed "always turn right", and
-//             never a blind timer alone deciding when to give up.
-enum NavMode { NAV_TRACK, NAV_CREEP, NAV_TRY };
+// ---- Line-lost navigation ----
+// Weighted-average PID is ALWAYS the one driving steering below — this is
+// the proven, reliable technique for a single-sensor-row bot, and it is
+// deliberately never replaced by an open-loop command. A wide/junction-ish
+// sensor pattern is just fed into the same weighted average like any other
+// reading (a symmetric cross naturally averages out near "straight" on its
+// own, with no special-case needed); the ONLY thing that gets special
+// handling here is the line being genuinely gone.
+//
+// NAV_TRACK : normal PID tracking (or riding out a momentary 1-2 cycle
+//             sensor blip on last-known error, same as before).
+// NAV_TRY   : entered only after the line has been continuously gone for
+//             LOST_GRACE_MS (debounced -- a brief flicker never triggers
+//             this). Walks a fixed priority Left -> Right -> U-turn, each
+//             attempt bounded by encoder ticks AND a time ceiling (guards
+//             wheel slip), abandoned in favor of the next option the
+//             instant either bound is hit or the line is seen again. This
+//             replaces the old "guess the last drift sign" behavior with
+//             a deterministic, sensor-verified chain -- without ever
+//             touching the PID path that handles ordinary tracking.
+const unsigned long LOST_GRACE_MS = 120; // ignore line-loss shorter than this
+enum NavMode { NAV_TRACK, NAV_TRY };
 NavMode navMode = NAV_TRACK;
-int tryIndex = 0; // 0=Left,1=Right,2=U-turn, once in NAV_TRY
+int tryIndex = 0; // 0=Left,1=Right,2=U-turn
 long navEncStart = 0;
 unsigned long navPhaseStart = 0;
+unsigned long lostSince = 0;
 bool leftBranchSeen = false, rightBranchSeen = false;
 const char* tryName[3] = {"LEFT", "RIGHT", "UTURN"};
 
 // Corner-aware cruise speed: back off the harder the PID has to correct,
 // so a higher baseSpeed doesn't mean breaking traction on every curve.
+// This only scales the forward-speed component -- it never limits how
+// fast the left/right differential itself can change, so steering stays
+// fully responsive through sharp corners.
 int dynamicCruiseSpeed(float output) {
   int aggressiveness = constrain((int)fabsf(output), 0, baseSpeed);
   int cruise = baseSpeed - (aggressiveness * 2) / 3;
   return max(cruise, baseSpeed / MIN_CRUISE_FRACTION);
-}
-
-// Ramp actual motor output toward a target instead of jumping straight to
-// it — limits how fast torque direction/magnitude can change, which is
-// what actually breaks traction at speed, not the top speed itself.
-int rampedLeftOut = 0, rampedRightOut = 0;
-void driveRamped(int leftTarget, int rightTarget) {
-  rampedLeftOut  += constrain(leftTarget  - rampedLeftOut,  -MOTOR_RAMP_STEP, MOTOR_RAMP_STEP);
-  rampedRightOut += constrain(rightTarget - rampedRightOut, -MOTOR_RAMP_STEP, MOTOR_RAMP_STEP);
-  setLeftMotor(constrain(rampedLeftOut, -255, 255));
-  setRightMotor(constrain(rampedRightOut, -255, 255));
 }
 
 void lineFollowLoop() {
@@ -814,10 +808,9 @@ void lineFollowLoop() {
     pidLastError = 0;
     navMode = NAV_TRACK;
     tryIndex = 0;
+    lostSince = 0;
     leftBranchSeen = false;
     rightBranchSeen = false;
-    rampedLeftOut = 0;
-    rampedRightOut = 0;
     beepStart();
     lineFollowStarting = false;
   }
@@ -826,17 +819,13 @@ void lineFollowLoop() {
   normalizeSensors();
 
   long weightedSum = 0, sum = 0;
-  int onCount = 0;
   for (int i = 0; i < NUM_SENSORS; i++) {
     int w = lineWeight(i);
     weightedSum += (long)w * sensorPosition(i);
     sum += w;
-    if (w > ON_THRESH) onCount++;
   }
   bool lineFound = sum > (long)(NUM_SENSORS * 30);
   float error = lineFound ? (float)weightedSum / (float)sum : pidLastError;
-  bool junctionWide = onCount >= JUNCTION_ON_COUNT;
-  bool trackable = lineFound && !junctionWide; // a single, followable line segment
 
   // Remember which side has shown a branch recently, using the outermost
   // 3 sensors each edge — so NAV_TRY can skip a direction with nothing
@@ -844,50 +833,41 @@ void lineFollowLoop() {
   if (lineWeight(0) > ON_THRESH || lineWeight(1) > ON_THRESH || lineWeight(2) > ON_THRESH) leftBranchSeen = true;
   if (lineWeight(NUM_SENSORS-1) > ON_THRESH || lineWeight(NUM_SENSORS-2) > ON_THRESH || lineWeight(NUM_SENSORS-3) > ON_THRESH) rightBranchSeen = true;
 
+  if (lineFound) lostSince = 0;
+  else if (lostSince == 0) lostSince = millis();
+  bool sustainedLoss = !lineFound && lostSince != 0 && (millis() - lostSince > LOST_GRACE_MS);
+
   long encNow = (leftEncCount + rightEncCount) / 2;
   long ticksThisPhase = encNow - navEncStart;
   unsigned long msThisPhase = millis() - navPhaseStart;
-  bool phaseExpired = (ticksThisPhase >= CREEP_TICKS) || (msThisPhase >= NAV_PHASE_TIMEOUT_MS);
-  bool tryExpired    = (ticksThisPhase >= TRY_TICKS)   || (msThisPhase >= NAV_PHASE_TIMEOUT_MS);
+  bool tryExpired = (ticksThisPhase >= TRY_TICKS) || (msThisPhase >= NAV_PHASE_TIMEOUT_MS);
 
   int left = 0, right = 0;
 
   if (navMode == NAV_TRACK) {
-    if (!trackable) {
-      // Junction-wide pattern or the line just vanished -- don't guess,
-      // creep straight first and keep watching the sensors.
-      navMode = NAV_CREEP;
-      navEncStart = encNow;
-      navPhaseStart = millis();
-      left = right = NAV_TURN_SPEED;
-    } else {
-      if (lineFound) {
-        pidIntegral += error;
-        pidIntegral = constrain(pidIntegral, -50000, 50000);
-      }
-      float derivative = error - pidLastError;
-      float output = Kp * error + Ki * pidIntegral + Kd * derivative;
-      pidLastError = error;
-      int cruise = dynamicCruiseSpeed(output);
-      left  = constrain(cruise - (int)output, -255, 255);
-      right = constrain(cruise + (int)output, -255, 255);
-    }
-  } else if (navMode == NAV_CREEP) {
-    left = right = NAV_TURN_SPEED;
-    if (trackable) {
-      navMode = NAV_TRACK;
-      pidLastError = error; // adopt current reading, avoid a derivative spike
-    } else if (phaseExpired) {
-      // Straight didn't resolve it -- now it's a real decision point.
-      tryIndex = 0;
+    if (sustainedLoss) {
       navMode = NAV_TRY;
+      tryIndex = 0;
       navEncStart = encNow;
       navPhaseStart = millis();
       leftBranchSeen = false;
       rightBranchSeen = false;
       beep(1200, 30);
     }
-  } else { // NAV_TRY
+    // PID runs every single cycle in NAV_TRACK, loss or not: `error` above
+    // already falls back to pidLastError on a momentary blip, so a 1-2
+    // cycle flicker just holds the last correction instead of freezing.
+    if (lineFound) {
+      pidIntegral += error;
+      pidIntegral = constrain(pidIntegral, -50000, 50000);
+    }
+    float derivative = error - pidLastError;
+    float output = Kp * error + Ki * pidIntegral + Kd * derivative;
+    pidLastError = error;
+    int cruise = dynamicCruiseSpeed(output);
+    left  = constrain(cruise - (int)output, -255, 255);
+    right = constrain(cruise + (int)output, -255, 255);
+  } else { // NAV_TRY -- only reached after LOST_GRACE_MS of continuous loss
     int choice = tryIndex; // 0=Left,1=Right,2=U-turn
     bool available = (choice == 0) ? leftBranchSeen : (choice == 1) ? rightBranchSeen : true;
     if (!available) {
@@ -898,9 +878,10 @@ void lineFollowLoop() {
       if (choice == 0)      { left = -NAV_TURN_SPEED; right =  NAV_TURN_SPEED; } // pivot left
       else if (choice == 1) { left =  NAV_TURN_SPEED; right = -NAV_TURN_SPEED; } // pivot right
       else                  { left = -NAV_TURN_SPEED; right =  NAV_TURN_SPEED; } // U-turn: sustained left pivot
-      if (trackable) {
+      if (lineFound) {
         navMode = NAV_TRACK;
         pidLastError = error;
+        lostSince = 0;
       } else if (tryExpired) {
         // This direction didn't pan out within its bound -- fall through
         // to the next priority option, not a repeat of the same guess.
@@ -911,10 +892,11 @@ void lineFollowLoop() {
     }
   }
 
-  driveRamped(left, right);
+  setLeftMotor(left);
+  setRightMotor(right);
 
-  if (!trackable && millis() - lastLineLostBeep > 500) { beepError(); lastLineLostBeep = millis(); }
-  updateLineFollowLED(navMode == NAV_TRACK && trackable);
+  if (sustainedLoss && millis() - lastLineLostBeep > 500) { beepError(); lastLineLostBeep = millis(); }
+  updateLineFollowLED(navMode == NAV_TRACK && lineFound);
 
   static unsigned long lastDraw = 0;
   if (millis() - lastDraw >= 50) { // ~20 Hz screen refresh, decoupled from the control loop above
@@ -924,8 +906,6 @@ void lineFollowLoop() {
     display.setCursor(0, 14);
     if (navMode == NAV_TRACK) {
       display.print("Err: "); display.println((int)error);
-    } else if (navMode == NAV_CREEP) {
-      display.println("Creep: straight?");
     } else {
       display.print("Try: "); display.println(tryName[tryIndex]);
     }
@@ -935,24 +915,21 @@ void lineFollowLoop() {
     display.setCursor(90, 24);
     display.print(directionArrow(left, right));
     display.setCursor(0, 40);
-    display.println(trackable ? "Line: OK" : (navMode == NAV_TRACK ? "Line: LOST" : "Line: DECIDING"));
+    display.println(lineFound ? "Line: OK" : (navMode == NAV_TRACK ? "Line: LOST" : "Line: SEARCH"));
     oledFooter("BACK = Stop");
     display.display();
 
 #if DEBUG_SERIAL
     Serial.print("nav="); Serial.print((int)navMode);
     Serial.print(" err="); Serial.print(error);
-    Serial.print(" on="); Serial.print(onCount);
     Serial.print(" L="); Serial.print(left);
     Serial.print(" R="); Serial.print(right);
-    Serial.print(" trackable="); Serial.println(trackable ? 1 : 0);
+    Serial.print(" found="); Serial.println(lineFound ? 1 : 0);
 #endif
   }
 
   if (back()) {
     stopMotors();
-    rampedLeftOut = 0;
-    rampedRightOut = 0;
     beepBack();
     enterState(STATE_MENU);
   }
