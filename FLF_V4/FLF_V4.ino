@@ -768,34 +768,40 @@ const char* directionArrow(int left, int right) {
 //
 // NAV_TRACK  : normal PID tracking (a 1-2 cycle sensor blip just holds the
 //              last correction via pidLastError, doesn't freeze).
-// NAV_SEARCH : entered after LOST_GRACE_MS of continuous loss. A SINGLE
-//              continuous forward-only arc -- direction picked once (by
-//              whichever edge sensors saw the line more recently), then
-//              escalated in stages the longer it goes unresolved: gentle
-//              differential first (handles a dashed line / brief gap with
-//              barely a course change), progressively sharper, but the
-//              INNER WHEEL NEVER GOES NEGATIVE. No in-place pivot, ever.
-//              A reversed wheel is a hard, sudden, traction-breaking move
-//              on a real gearbox, and it's what was actually causing the
-//              erratic "roams the room" behavior -- every arc here stays
-//              net-forward, same as a taped-floor bot should.
-// NAV_GIVEUP : the arc ran for SEARCH_MAX_TICKS / SEARCH_TIME_CEILING_MS
+// NAV_SEARCH : entered after LOST_GRACE_MS of continuous loss. Reverse-pivot
+//              search, edge-sensor + time tiered -- ported directly from
+//              the referenced STM32_Enhanced_LineFollower.ino's actually-
+//              working recovery branch (confirmed: it's called from loop(),
+//              unlike that file's dead RECOVERY_BREAK/REVERSE/ZIGZAG state
+//              machine, which references undeclared variables and isn't
+//              wired up). Priority each cycle: (1) whichever edge sensor
+//              saw the line MOST RECENTLY (within 500ms) pivots that way
+//              immediately, full speed; (2) failing that, lastEdgeDir (the
+//              last side that won #1, persists across searches this run)
+//              pivots that way for the first 500ms of this loss, then eases
+//              off; (3) with no evidence at all, try left 0-300ms, right
+//              300-600ms, then lean forward. This DOES reverse a wheel --
+//              that's a deliberate choice this time (matching what's
+//              proven working in the reference), not an oversight.
+// NAV_GIVEUP : the search ran for SEARCH_MAX_TICKS / SEARCH_TIME_CEILING_MS
 //              with no success -- STOP completely instead of searching
-//              forever. A loud alarm marks it; placing the bot back on the
-//              line resumes tracking on its own, or BACK returns to menu.
+//              forever (the reference has an equivalent timeout-then-stop,
+//              but ours is encoder-tick backed too, not just a timer). A
+//              loud alarm marks it; placing the bot back on the line
+//              resumes tracking on its own, or BACK returns to menu.
 const unsigned long LOST_GRACE_MS = 120;      // ignore line-loss shorter than this
-const long SEARCH_STAGE1_TICKS = 20;          // gentle bias while this young (dashed-line-friendly)
-const long SEARCH_STAGE2_TICKS = 55;          // sharper bias between stage1 and here
-const long SEARCH_MAX_TICKS = 110;            // sharpest forward-only arc beyond here; give up past this
+const unsigned long EDGE_MEMORY_MS = 500;     // how long a recent edge-sensor hit counts as "recent"
+const long SEARCH_MAX_TICKS = 110;            // give up past this many encoder ticks of searching
 const unsigned long SEARCH_TIME_CEILING_MS = 1800; // backup vs wheel slip (ticks alone can't be trusted)
 
 enum NavMode { NAV_TRACK, NAV_SEARCH, NAV_GIVEUP };
 NavMode navMode = NAV_TRACK;
-int searchDir = 0; // 0=curve left (right wheel outer), 1=curve right (left wheel outer) -- picked once per search
 long navEncStart = 0;
 unsigned long navPhaseStart = 0;
 unsigned long lostSince = 0;
-bool leftBranchSeen = false, rightBranchSeen = false;
+bool leftEdgeSeen = false, rightEdgeSeen = false;   // sticky, cleared only at line-follow start
+unsigned long leftEdgeTime = 0, rightEdgeTime = 0;  // updated every cycle an edge sensor is hot
+int lastEdgeDir = 0; // -1=left, 1=right, 0=none yet -- persists across searches this run
 
 void lineFollowLoop() {
   if (lineFollowStarting) {
@@ -803,8 +809,9 @@ void lineFollowLoop() {
     pidLastError = 0;
     navMode = NAV_TRACK;
     lostSince = 0;
-    leftBranchSeen = false;
-    rightBranchSeen = false;
+    leftEdgeSeen = false;
+    rightEdgeSeen = false;
+    lastEdgeDir = 0;
     beepStart();
     lineFollowStarting = false;
   }
@@ -821,11 +828,11 @@ void lineFollowLoop() {
   bool lineFound = sum > (long)(NUM_SENSORS * 30);
   float error = lineFound ? (float)weightedSum / (float)sum : pidLastError;
 
-  // Remember which side has shown a branch recently, using the outermost
-  // 3 sensors each edge -- used to pick which way NAV_SEARCH curves first
-  // (evidence-based, not a fixed hardcoded side).
-  if (lineWeight(0) > ON_THRESH || lineWeight(1) > ON_THRESH || lineWeight(2) > ON_THRESH) leftBranchSeen = true;
-  if (lineWeight(NUM_SENSORS-1) > ON_THRESH || lineWeight(NUM_SENSORS-2) > ON_THRESH || lineWeight(NUM_SENSORS-3) > ON_THRESH) rightBranchSeen = true;
+  // Edge-sensor memory: timestamp every cycle either outer trio is hot, so
+  // NAV_SEARCH can ask "which side saw the line MOST RECENTLY" rather than
+  // just "ever, at some point."
+  if (lineWeight(0) > ON_THRESH || lineWeight(1) > ON_THRESH || lineWeight(2) > ON_THRESH) { leftEdgeSeen = true; leftEdgeTime = millis(); }
+  if (lineWeight(NUM_SENSORS-1) > ON_THRESH || lineWeight(NUM_SENSORS-2) > ON_THRESH || lineWeight(NUM_SENSORS-3) > ON_THRESH) { rightEdgeSeen = true; rightEdgeTime = millis(); }
 
   if (lineFound) lostSince = 0;
   else if (lostSince == 0) lostSince = millis();
@@ -842,10 +849,6 @@ void lineFollowLoop() {
       navMode = NAV_SEARCH;
       navEncStart = encNow;
       navPhaseStart = millis();
-      // Direction picked ONCE here, from evidence, not re-decided per stage.
-      searchDir = (rightBranchSeen && !leftBranchSeen) ? 1 : 0; // 0=left tie-break
-      leftBranchSeen = false;
-      rightBranchSeen = false;
       beep(1200, 50);
     }
     // PID runs every single cycle in NAV_TRACK, loss or not: `error` above
@@ -877,16 +880,26 @@ void lineFollowLoop() {
       stopMotors();
       for (int i = 0; i < 4; i++) { beep(3200, 150); delay(180); } // loud, unmistakable
     } else {
-      // Escalating forward-only arc -- inner wheel slows as the search
-      // drags on, but it never goes negative. Outer wheel stays at full
-      // search speed throughout, so the bot keeps making net-forward
-      // progress the whole time (never a stationary spin).
-      float innerFrac = (ticksThisPhase < SEARCH_STAGE1_TICKS) ? 0.55f
-                       : (ticksThisPhase < SEARCH_STAGE2_TICKS) ? 0.15f
-                       : 0.0f;
-      int inner = (int)(NAV_TURN_SPEED * innerFrac);
-      if (searchDir == 0) { left = inner;         right = NAV_TURN_SPEED; } // curve left
-      else                 { left = NAV_TURN_SPEED; right = inner;        } // curve right
+      unsigned long now = millis();
+      long msSinceLoss = (long)(now - lostSince);
+      bool recentLeft  = leftEdgeSeen  && (now - leftEdgeTime)  < EDGE_MEMORY_MS;
+      bool recentRight = rightEdgeSeen && (now - rightEdgeTime) < EDGE_MEMORY_MS;
+
+      if (recentLeft && !recentRight) {
+        left = -NAV_TURN_SPEED; right = NAV_TURN_SPEED; lastEdgeDir = -1;
+      } else if (recentRight && !recentLeft) {
+        left = NAV_TURN_SPEED; right = -NAV_TURN_SPEED; lastEdgeDir = 1;
+      } else if (lastEdgeDir == -1) {
+        if (msSinceLoss < 500) { left = -NAV_TURN_SPEED; right = NAV_TURN_SPEED; }
+        else                   { left = NAV_TURN_SPEED / 3; right = NAV_TURN_SPEED; }
+      } else if (lastEdgeDir == 1) {
+        if (msSinceLoss < 500) { left = NAV_TURN_SPEED; right = -NAV_TURN_SPEED; }
+        else                   { left = NAV_TURN_SPEED; right = NAV_TURN_SPEED / 3; }
+      } else { // no evidence at all yet -- brief zigzag, then lean forward
+        if      (msSinceLoss < 300) { left = -NAV_TURN_SPEED; right = NAV_TURN_SPEED; }
+        else if (msSinceLoss < 600) { left = NAV_TURN_SPEED; right = -NAV_TURN_SPEED; }
+        else                        { left = NAV_TURN_SPEED; right = NAV_TURN_SPEED / 3; }
+      }
     }
 
   } else { // NAV_GIVEUP -- stopped dead, no motion, until repositioned or BACK
@@ -912,7 +925,7 @@ void lineFollowLoop() {
     oledHeader("LINE FOLLOWING");
     display.setCursor(0, 14);
     if (navMode == NAV_TRACK)       { display.print("Err: "); display.println((int)error); }
-    else if (navMode == NAV_SEARCH) { display.print("Search: "); display.println(searchDir == 0 ? "<-" : "->"); }
+    else if (navMode == NAV_SEARCH) { display.print("Search: "); display.println(lastEdgeDir < 0 ? "<-" : lastEdgeDir > 0 ? "->" : "?"); }
     else                             { display.println("STOPPED - lost"); }
     display.setCursor(0, 24);
     display.print("L:"); display.print(left);
