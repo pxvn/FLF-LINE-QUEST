@@ -168,9 +168,6 @@ const int ON_THRESH = 500;        // per-sensor lineWeight() above this = "on li
                                    // decide which side has a branch during a search
 const int NAV_TURN_SPEED = 110;   // reduced, traction-friendly speed while searching
 
-// ---- Corner-aware speed profiling ----
-const int MIN_CRUISE_FRACTION = 2; // dynamic cruise speed never drops below baseSpeed/this
-
 // =====================================================================
 //  GLOBAL OBJECTS
 // =====================================================================
@@ -800,17 +797,6 @@ unsigned long navPhaseStart = 0;
 unsigned long lostSince = 0;
 bool leftBranchSeen = false, rightBranchSeen = false;
 
-// Corner-aware cruise speed: back off the harder the PID has to correct,
-// so a higher baseSpeed doesn't mean breaking traction on every curve.
-// This only scales the forward-speed component -- it never limits how
-// fast the left/right differential itself can change, so steering stays
-// fully responsive through sharp corners.
-int dynamicCruiseSpeed(float output) {
-  int aggressiveness = constrain((int)fabsf(output), 0, baseSpeed);
-  int cruise = baseSpeed - (aggressiveness * 2) / 3;
-  return max(cruise, baseSpeed / MIN_CRUISE_FRACTION);
-}
-
 void lineFollowLoop() {
   if (lineFollowStarting) {
     pidIntegral = 0;
@@ -872,9 +858,14 @@ void lineFollowLoop() {
     float derivative = error - pidLastError;
     float output = Kp * error + Ki * pidIntegral + Kd * derivative;
     pidLastError = error;
-    int cruise = dynamicCruiseSpeed(output);
-    left  = constrain(cruise - (int)output, -255, 255);
-    right = constrain(cruise + (int)output, -255, 255);
+    // Same as V3, deliberately: baseSpeed +- output, no cruise scaling. A
+    // "back off cruise the harder PID corrects" scheme was tried here and
+    // it silently reversed the inner wheel on any sufficiently sharp
+    // correction (cruise shrinks faster than output grows), which breaks
+    // traction on ordinary curves -- not just line-lost recovery. That's
+    // gone; this is the plain, proven differential.
+    left  = constrain(baseSpeed - (int)output, -255, 255);
+    right = constrain(baseSpeed + (int)output, -255, 255);
 
   } else if (navMode == NAV_SEARCH) {
     if (lineFound) {
