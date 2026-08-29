@@ -228,6 +228,11 @@ int sensorNorm[NUM_SENSORS]; // 0-1000 normalized, hi (calibrated max) -> 1000
 // line to pick the right setting; it's persisted to flash.
 bool lineIsDark = true;
 
+// Which side wins when both outer sensor groups see line at once during a
+// junction (see lastEdgeDir in lineFollowLoop). Set from the Settings menu
+// before starting a run, not hardcoded; persisted to flash.
+bool turnPriorityLeft = true;
+
 // =====================================================================
 //  ENCODER COUNTS
 // =====================================================================
@@ -518,6 +523,7 @@ bool saveSettings() {
   prefs.putFloat("kd", Kd);
   prefs.putInt("base", baseSpeed);
   prefs.putInt("tspd", testSpeed);
+  prefs.putBool("tpleft", turnPriorityLeft);
   prefs.end();
 
   prefs.begin("linefw", true);
@@ -525,7 +531,8 @@ bool saveSettings() {
             prefs.getFloat("ki", Ki + 1) == Ki &&
             prefs.getFloat("kd", Kd + 1) == Kd &&
             prefs.getInt("base", baseSpeed + 1) == baseSpeed &&
-            prefs.getInt("tspd", testSpeed + 1) == testSpeed;
+            prefs.getInt("tspd", testSpeed + 1) == testSpeed &&
+            prefs.getBool("tpleft", !turnPriorityLeft) == turnPriorityLeft;
   prefs.end();
 
   confirmSaveResult(ok);
@@ -538,6 +545,7 @@ void loadSettings() {
   Kd = prefs.getFloat("kd", Kd);
   baseSpeed = prefs.getInt("base", baseSpeed);
   testSpeed = prefs.getInt("tspd", testSpeed);
+  turnPriorityLeft = prefs.getBool("tpleft", turnPriorityLeft);
   prefs.end();
 }
 
@@ -908,12 +916,14 @@ void lineFollowLoop() {
     }
   }
   // Update the sticky turn-direction memory from this cycle's edge reads.
-  // LEFT priority when both sides are active at once (per the arena) --
-  // previously this fell out of loop-iteration order (right silently won
-  // by being processed last), not a deliberate choice. Neither side active
-  // this cycle leaves lastEdgeDir untouched (stays sticky from before).
-  if (leftEdgeNow)       lastEdgeDir = -1;
-  else if (rightEdgeNow) lastEdgeDir = 1;
+  // When both sides are active at once, turnPriorityLeft (a Settings
+  // option, not a hardcoded side) decides the tie -- previously this fell
+  // out of loop-iteration order (right silently won by being processed
+  // last). Only one side active always wins regardless of the setting;
+  // neither active this cycle leaves lastEdgeDir untouched (sticky).
+  if (leftEdgeNow && rightEdgeNow)  lastEdgeDir = turnPriorityLeft ? -1 : 1;
+  else if (leftEdgeNow)             lastEdgeDir = -1;
+  else if (rightEdgeNow)            lastEdgeDir = 1;
 
   // ---- End Zone: sustained wide-black reading, not just a junction blip ----
   if (onCount >= END_ZONE_MIN_SENSORS) {
@@ -1086,9 +1096,9 @@ void ledColorLoop() {
 //   DOWN = decrease
 //   OK   = increase
 //   BACK = save & back
-int pidParamIndex = 0; // 0=Kp,1=Ki,2=Kd,3=BaseSpeed,4=TestSpeed
-const char* settingsParamName[5] = {"Kp", "Ki", "Kd", "BaseSpd", "TestSpd"};
-const int settingsParamCount = 5;
+int pidParamIndex = 0; // 0=Kp,1=Ki,2=Kd,3=BaseSpeed,4=TestSpeed,5=TurnPriority
+const char* settingsParamName[6] = {"Kp", "Ki", "Kd", "BaseSpd", "TestSpd", "TurnPri"};
+const int settingsParamCount = 6;
 
 void settingsLoop() {
   oledHeader("SETTINGS");
@@ -1106,10 +1116,11 @@ void settingsLoop() {
     case 2: display.println(Kd, 2);        break;
     case 3: display.println(baseSpeed);    break;
     case 4: display.println(testSpeed);    break;
+    case 5: display.println(turnPriorityLeft ? "LEFT" : "RIGHT"); break;
   }
   display.setTextSize(1);
 
-  oledFooter("UP=Param DN/OK=-/+ BK=Sav");
+  oledFooter(pidParamIndex == 5 ? "UP=Param DN/OK=Toggle" : "UP=Param DN/OK=-/+ BK=Sav");
   display.display();
 
   if (up()) { pidParamIndex = (pidParamIndex + 1) % settingsParamCount; beep(1800,20); }
@@ -1124,6 +1135,7 @@ void settingsLoop() {
       case 2: Kd += dir * 0.02f; Kd = max(0.0f, Kd); break;
       case 3: baseSpeed += dir * 25; baseSpeed = constrain(baseSpeed, 0, 255); break;
       case 4: testSpeed += dir * 25; testSpeed = constrain(testSpeed, 0, 255); break;
+      case 5: turnPriorityLeft = !turnPriorityLeft; break; // binary -- either DN or OK just flips it
     }
     beep(2000, 20);
   }
