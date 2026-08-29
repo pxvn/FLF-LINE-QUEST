@@ -893,6 +893,7 @@ void lineFollowLoop() {
   // sensors are actually lit (which End Zone detection depends on).
   long weightedSum = 0, rawSum = 0, gainedSum = 0;
   int onCount = 0;
+  bool leftEdgeNow = false, rightEdgeNow = false;
   for (int i = 0; i < NUM_SENSORS; i++) {
     int w = lineWeight(i);
     rawSum += w;
@@ -902,9 +903,17 @@ void lineFollowLoop() {
     gainedSum += gw;
     if (w > ON_THRESH) {
       onCount++;
-      if (edge) lastEdgeDir = (i < EDGE_COUNT) ? -1 : 1; // sticky: remembers most recent side seen
+      if (i < EDGE_COUNT) leftEdgeNow = true;
+      else if (i >= NUM_SENSORS - EDGE_COUNT) rightEdgeNow = true;
     }
   }
+  // Update the sticky turn-direction memory from this cycle's edge reads.
+  // LEFT priority when both sides are active at once (per the arena) --
+  // previously this fell out of loop-iteration order (right silently won
+  // by being processed last), not a deliberate choice. Neither side active
+  // this cycle leaves lastEdgeDir untouched (stays sticky from before).
+  if (leftEdgeNow)       lastEdgeDir = -1;
+  else if (rightEdgeNow) lastEdgeDir = 1;
 
   // ---- End Zone: sustained wide-black reading, not just a junction blip ----
   if (onCount >= END_ZONE_MIN_SENSORS) {
