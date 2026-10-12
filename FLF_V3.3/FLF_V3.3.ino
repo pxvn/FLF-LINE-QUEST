@@ -1,27 +1,8 @@
-              /*
+            /*
   =====================================================================
-  LINE FOLLOWER ROBOT — Waveshare ESP32-S3-Pico  (V3.3: maze arena pass)
+  LINE FOLLOWER ROBOT — Waveshare ESP32-S3-Pico
   =====================================================================
-  Forked from FLF_V3 (kept as the stable baseline). Adds two things for
-  running on an actual junction/maze arena, both scoped to lineFollowLoop():
-    - Junction/lost-line handling: the outer 3 sensors each side are sticky
-      "which way did I last see the line" memory (LEFTMOST_N/RIGHTMOST_N).
-      When the line disappears entirely, the bot coasts straight for
-      LINE_LOST_COAST_MS (handles a junction crossbar or a gap without any
-      turn decision at all, most of the time) before committing to a turn
-      using that memory -- not a hardcoded direction, and not last-drift-
-      sign guessing like plain V3 did.
-    - Edge sensors also get an EDGE_GAIN multiplier in the weighted-average
-      PID error itself, so the bot reacts more decisively as the line
-      approaches the outer sensors (entering a turn) instead of just at
-      the moment it's fully lost.
-    - End Zone detection: a sustained (END_ZONE_HOLD_MS), wide
-      (END_ZONE_MIN_SENSORS+ of 14) black reading -- distinct from a brief
-      junction crossing -- stops the bot, lights the LED white, and plays a
-      finish tune. LED stays in normal mode colors the rest of the run, per
-      the "don't glow until the end zone" rule.
-
-  Original V3 feature list:
+  Features:
     - OLED + 4-button menu UI (button roles are logical, see "BUTTON
       HANDLING" below — physical wiring stays fixed, roles are mapped
       onto it so relabeling the enclosure never means touching every
@@ -169,23 +150,8 @@ int testSpeed = 180;     // 0-255, manual jog speed used by Motor Test; tune
                           // it from the Settings screen (adjustable there
                           // as its own parameter, see "TestSpd")
 
-int uTurnMinMs = 600;    // blind-pivot duration for the checkpoint U-turn: sensors are
-                          // ignored entirely until this elapses, so the checkpoint's own
-                          // crossing mark can't abort the turn a few degrees in. Tune from
-                          // Settings ("UturnMs") until the pivot lands a true ~180.
-
 const int ON_THRESH = 500; // per-sensor lineWeight() above this = "on line";
-                            // used by calibration's live tick row and by
-                            // junction edge-sensing below
-
-// ---- Junction / lost-line handling (see lineFollowLoop) ----
-const int EDGE_COUNT = 3;             // outer N sensors each side used for turn memory + gain boost
-const float EDGE_GAIN = 1.6f;         // extra weight multiplier on those outer sensors in the PID error
-const unsigned long LINE_LOST_COAST_MS = 200; // coast straight this long before committing to a turn
-
-// ---- End Zone detection (see lineFollowLoop) ----
-const int END_ZONE_MIN_SENSORS = 12;        // out of 14 must read "on" simultaneously
-const unsigned long END_ZONE_HOLD_MS = 400; // ...sustained this long (a normal junction crossing is brief)
+                            // used by calibration's live tick row
 
 // =====================================================================
 //  GLOBAL OBJECTS
@@ -209,9 +175,9 @@ bool lineFollowStarting = false;
 
 // Menu
 const char* menuItems[] = {
-  "Start Line Follow",
   "Calibrate Sensors",
   "Test Motors",
+  "Start Line Follow",
   "LED Color",
   "Settings"
 };
@@ -232,11 +198,6 @@ int sensorNorm[NUM_SENSORS]; // 0-1000 normalized, hi (calibrated max) -> 1000
 // with UP while calibrating and watch "Line: OK/LOST" over the actual
 // line to pick the right setting; it's persisted to flash.
 bool lineIsDark = true;
-
-// Which side wins when both outer sensor groups see line at once during a
-// junction (see lastEdgeDir in lineFollowLoop). Set from the Settings menu
-// before starting a run, not hardcoded; persisted to flash.
-bool turnPriorityLeft = true;
 
 // =====================================================================
 //  ENCODER COUNTS
@@ -528,8 +489,6 @@ bool saveSettings() {
   prefs.putFloat("kd", Kd);
   prefs.putInt("base", baseSpeed);
   prefs.putInt("tspd", testSpeed);
-  prefs.putBool("tpleft", turnPriorityLeft);
-  prefs.putInt("utms", uTurnMinMs);
   prefs.end();
 
   prefs.begin("linefw", true);
@@ -537,9 +496,7 @@ bool saveSettings() {
             prefs.getFloat("ki", Ki + 1) == Ki &&
             prefs.getFloat("kd", Kd + 1) == Kd &&
             prefs.getInt("base", baseSpeed + 1) == baseSpeed &&
-            prefs.getInt("tspd", testSpeed + 1) == testSpeed &&
-            prefs.getBool("tpleft", !turnPriorityLeft) == turnPriorityLeft &&
-            prefs.getInt("utms", uTurnMinMs + 1) == uTurnMinMs;
+            prefs.getInt("tspd", testSpeed + 1) == testSpeed;
   prefs.end();
 
   confirmSaveResult(ok);
@@ -552,8 +509,6 @@ void loadSettings() {
   Kd = prefs.getFloat("kd", Kd);
   baseSpeed = prefs.getInt("base", baseSpeed);
   testSpeed = prefs.getInt("tspd", testSpeed);
-  turnPriorityLeft = prefs.getBool("tpleft", turnPriorityLeft);
-  uTurnMinMs = prefs.getInt("utms", uTurnMinMs);
   prefs.end();
 }
 
@@ -605,9 +560,9 @@ void handleMenu() {
   if (down()) { menuIndex = (menuIndex + 1) % menuCount; beep(1800, 30); }
   if (select()) {
     switch (menuIndex) {
-      case 0: enterState(STATE_LINE_FOLLOW); lineFollowStarting = true; break;
-      case 1: enterState(STATE_CALIBRATION); calibPhase = CALIB_SELECT_MODE; break;
-      case 2: enterState(STATE_MOTOR_TEST); break;
+      case 0: enterState(STATE_CALIBRATION); calibPhase = CALIB_SELECT_MODE; break;
+      case 1: enterState(STATE_MOTOR_TEST); break;
+      case 2: enterState(STATE_LINE_FOLLOW); lineFollowStarting = true; break;
       case 3: enterState(STATE_LED_COLOR); break;
       case 4: enterState(STATE_PID_TUNE); break;
     }
@@ -831,187 +786,40 @@ const char* directionArrow(int left, int right) {
   return "---";
 }
 
-int lastEdgeDir = 0;            // -1=left, 1=right, 0=neither seen yet -- sticky across the run
-unsigned long lineLostSince = 0; // 0 = currently on the line
-bool endZoneReached = false;
-unsigned long endZoneSince = 0;  // 0 = not currently seeing a wide block
-
-// ---- Checkpoint U-turn: a dead end with NO edge-sensor evidence on either
-// side (as opposed to a real branch, where an edge lit up recently) means
-// the track genuinely stops here -- per the arena, that's a checkpoint
-// marker and the correct move is a controlled 180, not a guessed corner
-// turn.
-//
-// uTurnMinMs is the important one: the checkpoint's own crossing mark
-// sweeps under the sensors almost immediately once the pivot starts, so
-// checking for "line reacquired" from the very first instant made this
-// stop after a few degrees instead of completing the turn -- exactly the
-// bug reported ("unable to take a U-turn... as it should"). The STM
-// reference's TURN_AROUND phase sidesteps this entirely: it's a BLIND,
-// fixed-duration pivot that ignores the sensors completely until the
-// phase timer is up. Same fix here: sensor reacquisition is ignored for
-// the first uTurnMinMs no matter what the checkpoint mark does, only
-// checked after that. uTurnMinMs is a guess (600ms @ UTURN_SPEED) --
-// tune it on the real arena until the pivot actually reads as ~180
-// degrees; it's the single most important constant in this file.
-bool uTurning = false;
-unsigned long uTurnStart = 0;
-// uTurnMinMs lives up with the other tunables (it's adjustable from
-// Settings as "UturnMs" -- it needs on-arena calibration to land a true
-// 180, so it shouldn't require a reflash to change).
-const unsigned long UTURN_MAX_MS = 2500; // safety cap if the line is never seen again
-const int UTURN_SPEED = 130;
-
 void lineFollowLoop() {
   if (lineFollowStarting) {
     pidIntegral = 0;
     pidLastError = 0;
-    lastEdgeDir = 0;
-    lineLostSince = 0;
-    endZoneReached = false;
-    endZoneSince = 0;
     beepStart();
     lineFollowStarting = false;
-  }
-
-  // Run's over -- just show the result and wait for BACK. No PID, no
-  // motor drive (already stopped at the moment End Zone was confirmed).
-  if (endZoneReached) {
-    oledHeader("END ZONE!");
-    display.setCursor(0, 24);
-    display.println("Run complete.");
-    oledFooter("BACK = Menu");
-    display.display();
-    if (back()) { setLED({0, 0, 0}); enterState(STATE_MENU); }
-    return;
   }
 
   readAllSensors();
   normalizeSensors();
 
-  // Mid-U-turn: blind pivot for the first uTurnMinMs (sensors ignored
-  // completely, same as the STM reference's fixed-duration TURN_AROUND),
-  // THEN look for the line reappearing under any sensor, up to UTURN_MAX_MS
-  // as a safety net. This bypasses the PID/error path entirely -- it's a
-  // fixed maneuver, not a steered one.
-  if (uTurning) {
-    unsigned long uElapsed = millis() - uTurnStart;
-    bool reacquired = false;
-    if (uElapsed >= uTurnMinMs) {
-      long checkSum = 0;
-      for (int i = 0; i < NUM_SENSORS; i++) checkSum += lineWeight(i);
-      reacquired = checkSum > (long)(NUM_SENSORS * 30);
-    }
-    if (reacquired || uElapsed > UTURN_MAX_MS) {
-      uTurning = false;
-      lineLostSince = 0;
-      pidLastError = 0; // avoid a derivative kick from whatever error existed before the turn
-    } else {
-      setLeftMotor(-UTURN_SPEED);
-      setRightMotor(UTURN_SPEED);
-      updateLineFollowLED(false);
-      static unsigned long lastUDraw = 0;
-      if (millis() - lastUDraw >= 50) {
-        lastUDraw = millis();
-        oledHeader("LINE FOLLOWING");
-        display.setCursor(0, 24);
-        display.println(uElapsed < uTurnMinMs ? "U-TURN (blind)" : "U-TURN (checking)");
-        oledFooter("BACK = Stop");
-        display.display();
-      }
-      if (back()) { stopMotors(); uTurning = false; beepBack(); enterState(STATE_MENU); }
-      return;
-    }
-  }
-
-  // weightedSum/rawSum use the true sensor weight for detection & End Zone
-  // sizing; gainedSum applies EDGE_GAIN on top for the error CALCULATION
-  // only, so edge sensors steer harder without lying about how many
-  // sensors are actually lit (which End Zone detection depends on).
-  long weightedSum = 0, rawSum = 0, gainedSum = 0;
-  int onCount = 0;
-  bool leftEdgeNow = false, rightEdgeNow = false, centerFound = false;
+  long weightedSum = 0;
+  long sum = 0;
   for (int i = 0; i < NUM_SENSORS; i++) {
     int w = lineWeight(i);
-    rawSum += w;
-    bool edge = (i < EDGE_COUNT) || (i >= NUM_SENSORS - EDGE_COUNT);
-    long gw = edge ? (long)(w * EDGE_GAIN) : (long)w;
-    weightedSum += gw * sensorPosition(i);
-    gainedSum += gw;
-    if (w > ON_THRESH) {
-      onCount++;
-      if (edge) { if (i < EDGE_COUNT) leftEdgeNow = true; else rightEdgeNow = true; }
-      else centerFound = true;
-    }
-  }
-  // Update the sticky turn-direction memory from this cycle's edge reads.
-  // When both sides are active at once, turnPriorityLeft (a Settings
-  // option, not a hardcoded side) decides the tie -- previously this fell
-  // out of loop-iteration order (right silently won by being processed
-  // last). Only one side active always wins regardless of the setting;
-  // neither active this cycle leaves lastEdgeDir untouched (sticky).
-  if (leftEdgeNow && rightEdgeNow)  lastEdgeDir = turnPriorityLeft ? -1 : 1;
-  else if (leftEdgeNow)             lastEdgeDir = -1;
-  else if (rightEdgeNow)            lastEdgeDir = 1;
-
-  // ---- End Zone: sustained wide-black reading, not just a junction blip ----
-  if (onCount >= END_ZONE_MIN_SENSORS) {
-    if (endZoneSince == 0) endZoneSince = millis();
-    if (millis() - endZoneSince >= END_ZONE_HOLD_MS) {
-      stopMotors();
-      endZoneReached = true;
-      setLED({255, 255, 255}); // only now -- never mid-run
-      beep(2200, 120); delay(140);
-      beep(2600, 120); delay(140);
-      beep(3000, 200);
-      return;
-    }
-  } else {
-    endZoneSince = 0;
+    weightedSum += (long)w * sensorPosition(i);
+    sum += w;
   }
 
-  bool lineFound = rawSum > (long)(NUM_SENSORS * 30); // "anything at all" -- still used for
-                                                        // integral gating, LED, and the display
+  bool lineFound = sum > (long)(NUM_SENSORS * 30); // threshold: something detected
   float error;
-  bool tracking; // true only when center sees the line -> smooth PID, integral allowed
-
-  if (centerFound) {
-    // Mid line is there: just go straight (well, follow it) -- no turn
-    // decision needed at all. Full weighted average (edge-gained) as usual.
-    tracking = true;
-    error = (float)weightedSum / (float)gainedSum;
-    lineLostSince = 0;
-  } else if (leftEdgeNow || rightEdgeNow) {
-    // Mid line is GONE but an edge sees it RIGHT NOW: commit that way
-    // immediately -- don't wait for the whole array to go blank first.
-    tracking = false;
-    if (leftEdgeNow && rightEdgeNow) error = turnPriorityLeft ? -6500 : 6500;
-    else                              error = leftEdgeNow ? -6500 : 6500;
-    lineLostSince = 0;
-    if (millis() - lastLineLostBeep > 500) { beepError(); lastLineLostBeep = millis(); }
+  if (lineFound) {
+    error = (float)weightedSum / (float)sum;
   } else {
-    // Nothing anywhere -- center AND both edges all blank. Coast briefly
-    // (covers a genuine momentary gap), then it's a dead end -> U-turn.
-    tracking = false;
-    if (lineLostSince == 0) lineLostSince = millis();
-    unsigned long lostFor = millis() - lineLostSince;
-    if (lostFor < LINE_LOST_COAST_MS) {
-      error = 0;
-    } else {
-      uTurning = true;
-      uTurnStart = millis();
-      beep(1000, 100);
-      setLeftMotor(-UTURN_SPEED);
-      setRightMotor(UTURN_SPEED);
-      return;
-    }
+    // Line lost: keep turning the direction it was last drifting
+    error = (pidLastError >= 0) ? 6500 : -6500;
+    if (millis() - lastLineLostBeep > 500) { beepError(); lastLineLostBeep = millis(); }
   }
 
-  // Only accumulate the integral term while smoothly tracking the center --
-  // a committed hard turn or a coast has `error` pinned to a saturated or
-  // zero value that would either slam the integral into its clamp or just
-  // waste the accumulated history; freeze it outside normal tracking.
-  if (tracking) {
+  // Only accumulate the integral term while actually on the line — while
+  // searching, `error` is pinned to +-6500 every tick, which would slam
+  // the integral into its clamp almost instantly and cause a hard
+  // overshoot the moment the line is reacquired.
+  if (lineFound) {
     pidIntegral += error;
     pidIntegral = constrain(pidIntegral, -50000, 50000);
   }
@@ -1039,7 +847,7 @@ void lineFollowLoop() {
     display.setCursor(90, 24);
     display.print(directionArrow(left, right));
     display.setCursor(0, 40);
-    display.println(tracking ? "Mid: OK" : (leftEdgeNow || rightEdgeNow) ? (leftEdgeNow ? "Turn: LEFT" : "Turn: RIGHT") : "Mid: LOST (coast)");
+    display.println(lineFound ? "Line: OK" : "Line: LOST");
     oledFooter("BACK = Stop");
     display.display();
 
@@ -1047,8 +855,6 @@ void lineFollowLoop() {
     Serial.print("err="); Serial.print(error);
     Serial.print(" L="); Serial.print(left);
     Serial.print(" R="); Serial.print(right);
-    Serial.print(" on="); Serial.print(onCount);
-    Serial.print(" edgeDir="); Serial.print(lastEdgeDir);
     Serial.print(" found="); Serial.println(lineFound ? 1 : 0);
 #endif
   }
@@ -1132,9 +938,9 @@ void ledColorLoop() {
 //   DOWN = decrease
 //   OK   = increase
 //   BACK = save & back
-int pidParamIndex = 0; // 0=Kp,1=Ki,2=Kd,3=BaseSpeed,4=TestSpeed,5=TurnPriority,6=UturnMs
-const char* settingsParamName[7] = {"Kp", "Ki", "Kd", "BaseSpd", "TestSpd", "TurnPri", "UturnMs"};
-const int settingsParamCount = 7;
+int pidParamIndex = 0; // 0=Kp,1=Ki,2=Kd,3=BaseSpeed,4=TestSpeed
+const char* settingsParamName[5] = {"Kp", "Ki", "Kd", "BaseSpd", "TestSpd"};
+const int settingsParamCount = 5;
 
 void settingsLoop() {
   oledHeader("SETTINGS");
@@ -1152,12 +958,10 @@ void settingsLoop() {
     case 2: display.println(Kd, 2);        break;
     case 3: display.println(baseSpeed);    break;
     case 4: display.println(testSpeed);    break;
-    case 5: display.println(turnPriorityLeft ? "LEFT" : "RIGHT"); break;
-    case 6: display.println(uTurnMinMs);   break;
   }
   display.setTextSize(1);
 
-  oledFooter(pidParamIndex == 5 ? "UP=Param DN/OK=Toggle" : "UP=Param DN/OK=-/+ BK=Sav");
+  oledFooter("UP=Param DN/OK=-/+ BK=Sav");
   display.display();
 
   if (up()) { pidParamIndex = (pidParamIndex + 1) % settingsParamCount; beep(1800,20); }
@@ -1172,8 +976,6 @@ void settingsLoop() {
       case 2: Kd += dir * 0.02f; Kd = max(0.0f, Kd); break;
       case 3: baseSpeed += dir * 25; baseSpeed = constrain(baseSpeed, 0, 255); break;
       case 4: testSpeed += dir * 25; testSpeed = constrain(testSpeed, 0, 255); break;
-      case 5: turnPriorityLeft = !turnPriorityLeft; break; // binary -- either DN or OK just flips it
-      case 6: uTurnMinMs += dir * 50; uTurnMinMs = constrain(uTurnMinMs, 0, 2000); break;
     }
     beep(2000, 20);
   }
